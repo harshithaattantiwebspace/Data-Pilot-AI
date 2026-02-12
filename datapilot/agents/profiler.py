@@ -121,7 +121,7 @@ class ProfilerAgent:
         # Target statistics
         target_numeric = y.copy()
         if not pd.api.types.is_numeric_dtype(y):
-            target_numeric = pd.Categorical(y).codes.astype(float)
+            target_numeric = pd.Series(pd.Categorical(y).codes.astype(float), index=y.index)
         
         features.append(np.clip(abs(target_numeric.skew()), -1, 1))  # target_skewness
         features.append(np.clip(target_numeric.kurtosis(), 0, 1))  # target_kurtosis

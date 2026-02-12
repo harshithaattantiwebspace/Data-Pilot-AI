@@ -49,7 +49,6 @@ class VisualizerAgent:
             ax.set_title('Target Distribution (Regression)')
         plt.tight_layout()
         self.figures['target_dist'] = fig
-        plt.close(fig)
         
         # Actual vs Predicted
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -63,7 +62,6 @@ class VisualizerAgent:
         ax.legend()
         plt.tight_layout()
         self.figures['actual_vs_pred'] = fig
-        plt.close(fig)
         
         # Classification-specific visualizations
         if task_type == 'classification':
@@ -77,7 +75,6 @@ class VisualizerAgent:
                 ax.set_xlabel('Predicted')
                 plt.tight_layout()
                 self.figures['confusion_matrix'] = fig
-                plt.close(fig)
             except:
                 pass
             
@@ -95,7 +92,6 @@ class VisualizerAgent:
                     ax.legend()
                     plt.tight_layout()
                     self.figures['roc_curve'] = fig
-                    plt.close(fig)
             except:
                 pass
         
@@ -111,7 +107,6 @@ class VisualizerAgent:
             ax.set_title('Residual Plot')
             plt.tight_layout()
             self.figures['residuals'] = fig
-            plt.close(fig)
             
             # Distribution of residuals
             fig, ax = plt.subplots(figsize=(10, 5))
@@ -121,7 +116,6 @@ class VisualizerAgent:
             ax.set_title('Distribution of Residuals')
             plt.tight_layout()
             self.figures['residuals_dist'] = fig
-            plt.close(fig)
         
         # Feature distributions
         numeric_cols = get_numeric_cols(X)
@@ -144,7 +138,6 @@ class VisualizerAgent:
             
             plt.tight_layout()
             self.figures['feature_dist'] = fig
-            plt.close(fig)
         
         # Feature importance (if models provided)
         if trained_models:
@@ -165,11 +158,11 @@ class VisualizerAgent:
                 ax.set_title('Top 10 Feature Importances')
                 plt.tight_layout()
                 self.figures['feature_importance'] = fig
-                plt.close(fig)
         
         report = {
             'plots_generated': list(self.figures.keys()),
             'total_plots': len(self.figures),
+            'figures': self.figures,
         }
         
         return report

@@ -133,7 +133,8 @@ def render_results(results: dict):
             st.write("**Dataset Profile**")
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Shape", results['profile']['dataset_shape'])
+                shape = results['profile']['dataset_shape']
+                st.metric("Shape", f"{shape[0]} x {shape[1]}")
             with col2:
                 st.metric("Task Type", results['task_type'].upper())
             with col3:
@@ -152,9 +153,11 @@ def render_results(results: dict):
             st.write("**Data Cleaning Report**")
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Original Shape", results['cleaning']['original_shape'])
+                orig_shape = results['cleaning']['original_shape']
+                st.metric("Original Shape", f"{orig_shape[0]} x {orig_shape[1]}")
             with col2:
-                st.metric("Final Shape", results['cleaning']['final_shape'])
+                final_shape = results['cleaning']['final_shape']
+                st.metric("Final Shape", f"{final_shape[0]} x {final_shape[1]}")
             with col3:
                 st.metric("Rows Removed", results['cleaning']['rows_removed'])
             
@@ -205,7 +208,14 @@ def render_results(results: dict):
         if 'visualization' in results:
             st.write("**Generated Visualizations**")
             st.write(f"Total plots: {results['visualization']['total_plots']}")
-            st.write(f"Plots: {', '.join(results['visualization']['plots_generated'])}")
+            
+            # Display all figures
+            if 'figures' in results['visualization']:
+                for plot_name, fig in results['visualization']['figures'].items():
+                    st.write(f"**{plot_name.replace('_', ' ').title()}**")
+                    st.pyplot(fig)
+            else:
+                st.write(f"Plots: {', '.join(results['visualization']['plots_generated'])}")
     
     with tab6:
         if 'explanation' in results:
