@@ -1,0 +1,54 @@
+# docker-compose.yml
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: datapilot-postgres
+    environment:
+      POSTGRES_USER: datapilot
+      POSTGRES_PASSWORD: datapilot123
+      POSTGRES_DB: datapilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Redis (Cache + Message Broker)
+  redis:
+    image: redis:7-alpine
+    container_name: datapilot-redis
+    ports:
+      - "6379:6379"
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: datapilot-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # Ollama LLM
+  ollama:
+    image: ollama/ollama:latest
+    container_name: datapilot-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  ollama_data:
