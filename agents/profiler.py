@@ -67,6 +67,16 @@ class ProfilerAgent(BaseAgent):
         # Step 7: Generate warnings about data issues
         warnings = self._generate_warnings(df, column_types)
         
+        # Step 8: describe()-based anomaly detection (like a real DS)
+        describe_anomalies = self._describe_anomaly_detection(df, column_types)
+        if describe_anomalies:
+            self.log(f"Found {len(describe_anomalies)} anomalies from describe() analysis")
+        
+        # Step 9: Check unique value uniformity (non-uniform categories)
+        uniformity_issues = self._check_unique_value_uniformity(df, column_types)
+        if uniformity_issues:
+            self.log(f"Found non-uniform categories in {len(uniformity_issues)} columns")
+        
         # Update pipeline state with all profiling results
         state['target_column'] = target_col
         state['task_type'] = task_type
@@ -75,6 +85,8 @@ class ProfilerAgent(BaseAgent):
             'statistics': statistics,
             'quality_score': quality_score,
             'warnings': warnings,
+            'describe_anomalies': describe_anomalies,
+            'uniformity_issues': uniformity_issues,
             'n_rows': len(df),
             'n_cols': len(df.columns)
         }
@@ -542,3 +554,127 @@ class ProfilerAgent(BaseAgent):
                 warnings.append(f"ℹ️ Column '{col}' appears to be an ID column — will be excluded from modeling")
         
         return warnings
+    
+    # =========================================================================
+    # STEP 8: describe()-Based Anomaly Detection
+    # =========================================================================
+    
+    def _describe_anomaly_detection(self, df: pd.DataFrame,
+                                     column_types: Dict[str, str]) -> List[Dict]:
+        """
+        Like a real data scientist using df.describe() to spot unusual patterns.
+        
+        Checks:
+          - max >> 75th percentile (extreme outliers)
+          - min << 25th percentile (extreme low values)
+          - mean far from median (heavy skew)
+          - std >> mean (high coefficient of variation)
+          - 50% of data = same value (near-constant)
+        """
+        anomalies = []
+        
+        numeric_cols = [c for c in df.columns if column_types.get(c) == 'numeric']
+        if not numeric_cols:
+            return anomalies
+        
+        desc = df[numeric_cols].describe()
+        
+        for col in desc.columns:
+            max_val = desc.loc['max', col]
+            min_val = desc.loc['min', col]
+            q75 = desc.loc['75%', col]
+            q25 = desc.loc['25%', col]
+            mean_val = desc.loc['mean', col]
+            std_val = desc.loc['std', col]
+            median_val = desc.loc['50%', col]
+            iqr = q75 - q25
+            
+            # Check: max >> 75th percentile (extreme outlier on the high end)
+            if iqr > 0 and max_val > q75 + 3 * iqr:
+                anomalies.append({
+                    'column': col,
+                    'issue': 'extreme_high_outlier',
+                    'detail': f"max ({max_val:.2f}) is far above Q3 + 3×IQR ({q75 + 3*iqr:.2f})",
+                    'severity': 'high'
+                })
+            
+            # Check: min << 25th percentile (extreme outlier on the low end)
+            if iqr > 0 and min_val < q25 - 3 * iqr:
+                anomalies.append({
+                    'column': col,
+                    'issue': 'extreme_low_outlier',
+                    'detail': f"min ({min_val:.2f}) is far below Q1 - 3×IQR ({q25 - 3*iqr:.2f})",
+                    'severity': 'high'
+                })
+            
+            # Check: mean very far from median (heavy skew)
+            if std_val > 0 and abs(mean_val - median_val) > 2 * std_val:
+                anomalies.append({
+                    'column': col,
+                    'issue': 'heavy_skew',
+                    'detail': f"mean ({mean_val:.2f}) far from median ({median_val:.2f}) — data is heavily skewed",
+                    'severity': 'medium'
+                })
+            
+            # Check: coefficient of variation > 2 (very high variability)
+            if mean_val != 0 and abs(std_val / mean_val) > 2:
+                cv = abs(std_val / mean_val)
+                anomalies.append({
+                    'column': col,
+                    'issue': 'high_variability',
+                    'detail': f"coefficient of variation = {cv:.1f} — very dispersed data",
+                    'severity': 'medium'
+                })
+            
+            # Check: >50% of values are identical (near-constant)
+            mode_count = df[col].value_counts().iloc[0] if len(df[col].value_counts()) > 0 else 0
+            if mode_count / len(df) > 0.5 and df[col].nunique() > 1:
+                pct = mode_count / len(df) * 100
+                anomalies.append({
+                    'column': col,
+                    'issue': 'dominant_value',
+                    'detail': f"{pct:.0f}% of rows have the same value — near-constant column",
+                    'severity': 'low'
+                })
+        
+        return anomalies
+    
+    # =========================================================================
+    # STEP 9: Unique Value Uniformity Check
+    # =========================================================================
+    
+    def _check_unique_value_uniformity(self, df: pd.DataFrame,
+                                        column_types: Dict[str, str]) -> Dict[str, Dict]:
+        """
+        Check for non-uniform category values that should be standardized.
+        
+        Detects issues like:
+          - Case inconsistency: 'Male', 'male', 'MALE' → should all be 'Male'
+          - Whitespace: ' Male', 'Male ', ' Male ' → should all be 'Male'
+          - Abbreviations: 'M', 'F' mixed with 'Male', 'Female'
+        
+        Returns: {column_name: {canonical_lower: [variant1, variant2, ...]}}
+        """
+        uniformity_issues = {}
+        
+        for col in df.columns:
+            if column_types.get(col) != 'categorical':
+                continue
+            
+            values = df[col].dropna().unique()
+            if len(values) > 50:  # Skip high-cardinality columns
+                continue
+            
+            # Check for case/whitespace inconsistency
+            lower_map = {}
+            for v in values:
+                v_str = str(v).strip().lower()
+                if v_str not in lower_map:
+                    lower_map[v_str] = []
+                lower_map[v_str].append(str(v))
+            
+            issues = {k: v for k, v in lower_map.items() if len(v) > 1}
+            if issues:
+                uniformity_issues[col] = issues
+        
+        return uniformity_issues

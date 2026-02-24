@@ -87,6 +87,14 @@ class FeatureAgent(BaseAgent):
             }
         
         # =====================================================================
+        # Step 4b: VIF-based multicollinearity removal
+        # =====================================================================
+        X, vif_info = self._remove_high_vif_features(X)
+        feature_report['vif_analysis'] = vif_info
+        if vif_info.get('removed_features'):
+            self.log(f"VIF: Removed {len(vif_info['removed_features'])} multicollinear features")
+        
+        # =====================================================================
         # Step 5: Encode target variable (classification only)
         # =====================================================================
         if task_type == 'classification':
@@ -271,3 +279,110 @@ class FeatureAgent(BaseAgent):
         
         self.log(f"  Selected top {len(top_features)} features by mutual information")
         return X, selection_info
+    
+    # =========================================================================
+    # STEP 4b: VIF-Based Multicollinearity Removal
+    # =========================================================================
+    
+    def _compute_vif(self, X: pd.DataFrame) -> Dict[str, float]:
+        """
+        Compute Variance Inflation Factor for each numeric feature.
+        
+        VIF measures how much a feature is explained by other features:
+          VIF = 1 / (1 - R²)  where R² is from regressing feature j on all others
+          
+          VIF = 1    → no multicollinearity
+          VIF = 1-5  → moderate (acceptable)
+          VIF = 5-10 → high (concerning)
+          VIF > 10   → severe (should remove one of the correlated features)
+        
+        Uses sklearn's LinearRegression instead of statsmodels to avoid
+        an extra dependency.
+        """
+        from sklearn.linear_model import LinearRegression
+        
+        vif_data = {}
+        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        
+        if len(numeric_cols) < 2:
+            return vif_data
+        
+        X_numeric = X[numeric_cols].fillna(0)
+        
+        for col in numeric_cols:
+            y_vif = X_numeric[col].values
+            X_vif = X_numeric.drop(columns=[col]).values
+            
+            if X_vif.shape[1] == 0:
+                continue
+            
+            try:
+                lr = LinearRegression()
+                lr.fit(X_vif, y_vif)
+                r2 = lr.score(X_vif, y_vif)
+                vif = 1.0 / (1.0 - r2) if r2 < 1.0 else float('inf')
+                vif_data[col] = round(vif, 2)
+            except Exception:
+                vif_data[col] = 1.0
+        
+        return vif_data
+    
+    def _remove_high_vif_features(self, X: pd.DataFrame,
+                                    threshold: float = 10.0) -> Tuple[pd.DataFrame, Dict]:
+        """
+        Iteratively remove the feature with highest VIF until all are below threshold.
+        
+        This is the standard data science approach to multicollinearity:
+          1. Compute VIF for all features
+          2. If max VIF > threshold, remove that feature
+          3. Repeat until all VIF ≤ threshold
+        
+        Args:
+            X: Feature DataFrame
+            threshold: VIF threshold (default 10 — standard practice)
+        
+        Returns:
+            Tuple of (cleaned DataFrame, VIF analysis report)
+        """
+        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        
+        # Skip if too few numeric features
+        if len(numeric_cols) < 3:
+            return X, {
+                'method': 'vif',
+                'threshold': threshold,
+                'removed_features': [],
+                'final_vif_scores': {},
+                'reason': 'Too few numeric features for VIF analysis'
+            }
+        
+        removed = []
+        max_iterations = min(len(numeric_cols), 20)  # Safety limit
+        
+        for _ in range(max_iterations):
+            vif_scores = self._compute_vif(X)
+            if not vif_scores:
+                break
+            
+            max_vif_col = max(vif_scores, key=vif_scores.get)
+            max_vif_val = vif_scores[max_vif_col]
+            
+            if max_vif_val > threshold:
+                X = X.drop(columns=[max_vif_col])
+                removed.append({'feature': max_vif_col, 'vif': max_vif_val})
+                self.log(f"  VIF: Removed '{max_vif_col}' (VIF={max_vif_val:.1f} > {threshold})")
+            else:
+                break
+        
+        # Final VIF scores
+        final_vif = self._compute_vif(X)
+        
+        vif_info = {
+            'method': 'vif',
+            'threshold': threshold,
+            'removed_features': removed,
+            'n_removed': len(removed),
+            'final_vif_scores': final_vif
+        }
+        
+        return X, vif_info

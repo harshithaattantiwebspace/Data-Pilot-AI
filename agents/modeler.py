@@ -154,6 +154,32 @@ class ModelerAgent(BaseAgent):
         self.log(f"  Improvement:       {ensemble_score - best_model_score:+.4f}")
         self.log(f"{'='*50}")
         
+        # =====================================================================
+        # Step 6: Overfitting Detection
+        # =====================================================================
+        overfitting_analysis = self._detect_overfitting(
+            X, y, ensemble_model, task_type, ensemble_score, cv_scores
+        )
+        if overfitting_analysis.get('is_suspicious'):
+            self.log(f"⚠️  OVERFITTING WARNING: {overfitting_analysis['reason']}")
+        
+        # =====================================================================
+        # Step 7: Error Analysis (which samples does the model get wrong?)
+        # =====================================================================
+        error_analysis = self._perform_error_analysis(
+            X, y, ensemble_model, task_type, state.get('raw_data'), state.get('target_column')
+        )
+        self.log(f"Error analysis: {len(error_analysis.get('worst_samples', []))} worst predictions analyzed")
+        
+        # =====================================================================
+        # Step 8: Segment Analysis (performance by data group)
+        # =====================================================================
+        segment_analysis = self._perform_segment_analysis(
+            X, y, ensemble_model, task_type, state.get('raw_data'),
+            state.get('target_column'), state.get('profile_report', {}).get('column_types', {})
+        )
+        self.log(f"Segment analysis: tested {len(segment_analysis.get('segments', []))} segments")
+        
         # Update pipeline state
         state['trained_models'] = trained_models
         state['cv_scores'] = cv_scores
@@ -161,6 +187,9 @@ class ModelerAgent(BaseAgent):
         state['ensemble_score'] = ensemble_score
         state['best_model_name'] = best_model_name
         state['model_recommendations'] = recommendations
+        state['overfitting_analysis'] = overfitting_analysis
+        state['error_analysis'] = error_analysis
+        state['segment_analysis'] = segment_analysis
         state['stage'] = 'modeled'
         
         return state
@@ -332,3 +361,328 @@ class ModelerAgent(BaseAgent):
                 f"with {len(estimators)} models: {[name for name, _ in estimators]}")
         
         return ensemble
+    
+    # =========================================================================
+    # STEP 6: Overfitting Detection
+    # =========================================================================
+    
+    def _detect_overfitting(self, X: pd.DataFrame, y: pd.Series,
+                             model, task_type: str,
+                             ensemble_score: float,
+                             cv_scores: Dict) -> Dict:
+        """
+        Detect potential overfitting — like a real DS who questions a 98% score.
+        
+        Checks:
+          1. Suspiciously high scores (>0.98 for classification, >0.99 for regression)
+          2. Train score vs CV score gap (>0.05 means overfitting)
+          3. High CV variance (models unstable across folds)
+          4. Score too close to 1.0 (likely data leakage or trivial task)
+        
+        Returns:
+            Dict with overfitting analysis results
+        """
+        analysis = {
+            'is_suspicious': False,
+            'warnings': [],
+            'train_score': None,
+            'cv_score': ensemble_score,
+            'gap': None,
+            'reason': ''
+        }
+        
+        # Check 1: Suspiciously high CV score
+        threshold = 0.98 if task_type == 'classification' else 0.99
+        if ensemble_score > threshold:
+            analysis['is_suspicious'] = True
+            analysis['warnings'].append(
+                f"Score of {ensemble_score:.4f} is suspiciously high (>{threshold}). "
+                f"Check for data leakage, target column in features, or trivially easy task."
+            )
+        
+        # Check 2: Train vs CV gap
+        try:
+            scoring = 'accuracy' if task_type == 'classification' else 'r2'
+            if hasattr(model, 'predict'):
+                from sklearn.metrics import accuracy_score, r2_score
+                y_pred = model.predict(X)
+                if task_type == 'classification':
+                    train_score = accuracy_score(y, y_pred)
+                else:
+                    train_score = r2_score(y, y_pred)
+                
+                analysis['train_score'] = round(float(train_score), 4)
+                gap = train_score - ensemble_score
+                analysis['gap'] = round(float(gap), 4)
+                
+                if gap > 0.05:
+                    analysis['is_suspicious'] = True
+                    analysis['warnings'].append(
+                        f"Train score ({train_score:.4f}) is {gap:.4f} higher than CV score "
+                        f"({ensemble_score:.4f}) — model is overfitting."
+                    )
+        except Exception:
+            pass
+        
+        # Check 3: High CV variance among individual models
+        if len(cv_scores) > 1:
+            score_values = list(cv_scores.values())
+            score_std = np.std(score_values)
+            score_range = max(score_values) - min(score_values)
+            
+            if score_range > 0.15:
+                analysis['warnings'].append(
+                    f"Models have very different scores (range: {score_range:.4f}). "
+                    f"Dataset might have noise or the models are inconsistent."
+                )
+            
+            analysis['model_score_std'] = round(float(score_std), 4)
+            analysis['model_score_range'] = round(float(score_range), 4)
+        
+        # Build summary reason
+        if analysis['warnings']:
+            analysis['reason'] = ' | '.join(analysis['warnings'])
+        else:
+            analysis['reason'] = 'No overfitting detected — scores look healthy.'
+        
+        return analysis
+    
+    # =========================================================================
+    # STEP 7: Error Analysis
+    # =========================================================================
+    
+    def _perform_error_analysis(self, X: pd.DataFrame, y: pd.Series,
+                                 model, task_type: str,
+                                 raw_data: pd.DataFrame = None,
+                                 target_col: str = None) -> Dict:
+        """
+        Analyze where the model makes mistakes — like a real DS doing error analysis.
+        
+        For classification:
+          - Which classes get confused most?
+          - Which samples are misclassified?
+          - Confusion matrix analysis
+        
+        For regression:
+          - Which samples have the highest error?
+          - Is there a pattern in the errors? (e.g., high errors for low values)
+          - Residual distribution analysis
+        """
+        error_report = {
+            'worst_samples': [],
+            'error_patterns': [],
+            'summary': ''
+        }
+        
+        try:
+            # Use cross-validated predictions to avoid evaluating on train data
+            from sklearn.model_selection import cross_val_predict
+            y_pred = cross_val_predict(model, X, y, cv=5)
+            
+            if task_type == 'classification':
+                # Find misclassified samples
+                from sklearn.metrics import confusion_matrix, classification_report
+                
+                misclassified_mask = y != y_pred
+                n_errors = misclassified_mask.sum()
+                error_rate = n_errors / len(y) * 100
+                
+                error_report['total_errors'] = int(n_errors)
+                error_report['error_rate'] = round(float(error_rate), 2)
+                
+                # Confusion matrix
+                cm = confusion_matrix(y, y_pred)
+                error_report['confusion_matrix'] = cm.tolist()
+                
+                # Per-class error rates
+                class_labels = sorted(y.unique())
+                class_errors = []
+                for cls in class_labels:
+                    cls_mask = y == cls
+                    cls_n = cls_mask.sum()
+                    cls_errors_n = (misclassified_mask & cls_mask).sum()
+                    cls_error_rate = cls_errors_n / cls_n * 100 if cls_n > 0 else 0
+                    class_errors.append({
+                        'class': str(cls),
+                        'total': int(cls_n),
+                        'errors': int(cls_errors_n),
+                        'error_rate': round(float(cls_error_rate), 2)
+                    })
+                error_report['class_errors'] = class_errors
+                
+                # Worst class
+                worst_class = max(class_errors, key=lambda x: x['error_rate'])
+                error_report['summary'] = (
+                    f"{error_rate:.1f}% overall error rate. "
+                    f"Worst class: '{worst_class['class']}' with {worst_class['error_rate']:.1f}% error rate."
+                )
+                
+            else:
+                # Regression: analyze high-error samples
+                from sklearn.metrics import mean_absolute_error, mean_squared_error
+                
+                errors = np.abs(y.values - y_pred)
+                error_report['mae'] = round(float(np.mean(errors)), 4)
+                error_report['rmse'] = round(float(np.sqrt(np.mean(errors**2))), 4)
+                error_report['median_error'] = round(float(np.median(errors)), 4)
+                
+                # Find worst predictions
+                worst_idx = np.argsort(errors)[-10:][::-1]
+                worst_samples = []
+                for idx in worst_idx:
+                    sample = {
+                        'index': int(idx),
+                        'actual': round(float(y.iloc[idx]), 2),
+                        'predicted': round(float(y_pred[idx]), 2),
+                        'error': round(float(errors[idx]), 2)
+                    }
+                    # Add original feature values if available
+                    if raw_data is not None and target_col:
+                        for col in raw_data.columns[:5]:
+                            if col != target_col:
+                                val = raw_data.iloc[idx][col]
+                                sample[col] = str(val)
+                    worst_samples.append(sample)
+                error_report['worst_samples'] = worst_samples
+                
+                # Check error patterns: do errors correlate with target magnitude?
+                y_vals = y.values.astype(float)
+                low_mask = y_vals <= np.percentile(y_vals, 25)
+                high_mask = y_vals >= np.percentile(y_vals, 75)
+                mid_mask = ~low_mask & ~high_mask
+                
+                patterns = []
+                for name, mask in [('low_values (Q1)', low_mask),
+                                     ('mid_values (Q2-Q3)', mid_mask),
+                                     ('high_values (Q4)', high_mask)]:
+                    if mask.sum() > 0:
+                        group_mae = np.mean(errors[mask])
+                        patterns.append({
+                            'group': name,
+                            'n_samples': int(mask.sum()),
+                            'mae': round(float(group_mae), 4)
+                        })
+                error_report['error_patterns'] = patterns
+                
+                # Summary
+                worst = max(patterns, key=lambda x: x['mae']) if patterns else None
+                if worst:
+                    error_report['summary'] = (
+                        f"MAE = {error_report['mae']:.4f}. "
+                        f"Highest error for {worst['group']} (MAE = {worst['mae']:.4f}). "
+                        f"Top 10 worst predictions shown below."
+                    )
+        except Exception as e:
+            error_report['summary'] = f"Error analysis failed: {str(e)}"
+        
+        return error_report
+    
+    # =========================================================================
+    # STEP 8: Segment Analysis
+    # =========================================================================
+    
+    def _perform_segment_analysis(self, X: pd.DataFrame, y: pd.Series,
+                                    model, task_type: str,
+                                    raw_data: pd.DataFrame = None,
+                                    target_col: str = None,
+                                    column_types: Dict = None) -> Dict:
+        """
+        Analyze model performance across data segments — like a real DS who
+        finds that the model works fine for age > 25 but fails for age < 25.
+        
+        For each numeric column, segments data into quantile-based groups
+        and measures performance per segment. This reveals WHERE the model
+        struggles.
+        """
+        segment_report = {
+            'segments': [],
+            'problem_segments': [],
+            'summary': ''
+        }
+        
+        if raw_data is None or target_col is None:
+            return segment_report
+        
+        try:
+            from sklearn.model_selection import cross_val_predict
+            y_pred = cross_val_predict(model, X, y, cv=5)
+            
+            column_types = column_types or {}
+            
+            # Test segments on original numeric columns
+            numeric_cols = [c for c in raw_data.columns
+                          if c != target_col
+                          and column_types.get(c) == 'numeric'
+                          and raw_data[c].nunique() > 5]
+            
+            # Limit to top 10 columns to avoid excessive computation
+            numeric_cols = numeric_cols[:10]
+            
+            overall_score = self._compute_segment_score(y, y_pred, task_type)
+            
+            for col in numeric_cols:
+                col_data = raw_data[col].iloc[:len(y)]
+                
+                try:
+                    # Split into quantile-based segments
+                    bins = pd.qcut(col_data, q=4, duplicates='drop')
+                    
+                    for segment_label in bins.unique():
+                        if pd.isna(segment_label):
+                            continue
+                        
+                        mask = bins == segment_label
+                        if mask.sum() < 10:  # Need at least 10 samples
+                            continue
+                        
+                        seg_score = self._compute_segment_score(
+                            y[mask.values], y_pred[mask.values], task_type
+                        )
+                        
+                        segment_info = {
+                            'column': col,
+                            'segment': str(segment_label),
+                            'n_samples': int(mask.sum()),
+                            'score': round(float(seg_score), 4),
+                            'overall_score': round(float(overall_score), 4),
+                            'gap': round(float(overall_score - seg_score), 4)
+                        }
+                        segment_report['segments'].append(segment_info)
+                        
+                        # Flag problem segments (performance significantly worse)
+                        if overall_score - seg_score > 0.1:
+                            segment_info['is_problem'] = True
+                            segment_report['problem_segments'].append(segment_info)
+                            
+                except Exception:
+                    continue
+            
+            # Summary
+            n_problems = len(segment_report['problem_segments'])
+            if n_problems > 0:
+                worst = max(segment_report['problem_segments'], key=lambda x: x['gap'])
+                segment_report['summary'] = (
+                    f"Found {n_problems} underperforming segments. "
+                    f"Worst: '{worst['column']}' in range {worst['segment']} "
+                    f"(score: {worst['score']:.4f} vs overall {worst['overall_score']:.4f}, "
+                    f"gap: {worst['gap']:.4f}). "
+                    f"Consider training separate models for these segments."
+                )
+            else:
+                segment_report['summary'] = "Model performs consistently across all data segments."
+            
+        except Exception as e:
+            segment_report['summary'] = f"Segment analysis failed: {str(e)}"
+        
+        return segment_report
+    
+    def _compute_segment_score(self, y_true, y_pred, task_type: str) -> float:
+        """Compute the appropriate score for a segment."""
+        from sklearn.metrics import accuracy_score, r2_score
+        try:
+            if task_type == 'classification':
+                return accuracy_score(y_true, y_pred)
+            else:
+                return r2_score(y_true, y_pred)
+        except Exception:
+            return 0.0
