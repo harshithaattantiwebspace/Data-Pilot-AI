@@ -523,8 +523,10 @@ elif active_view == 'ml':
                      f"{result.get('profile_report', {}).get('quality_score', 0)}/100")
 
         # Tabs for detailed results
-        tab_models, tab_profile, tab_cleaning, tab_viz, tab_explain = st.tabs([
-            "📊 Models", "📋 Data Profile", "🧹 Cleaning", "📈 Visualizations", "🔍 Explanations"
+        tab_models, tab_profile, tab_cleaning, tab_features, tab_viz, tab_explain, tab_errors, tab_segments, tab_predict = st.tabs([
+            "📊 Models", "📋 Data Profile", "🧹 Cleaning", "🔧 Features",
+            "📈 Visualizations", "🔍 Explanations", "⚠️ Error Analysis",
+            "📐 Segments", "🎯 Predict"
         ])
 
         # ── Models tab ──
@@ -547,6 +549,27 @@ elif active_view == 'ml':
                     st.markdown("#### RL Agent Recommendations")
                     for name, conf in recs:
                         st.write(f"→ **{name}** (confidence: {conf:.1%})")
+                
+                # Overfitting Detection
+                overfit = result.get('overfitting_analysis', {})
+                if overfit:
+                    if overfit.get('is_suspicious'):
+                        st.markdown("### ⚠️ Overfitting Warning")
+                        st.markdown(
+                            f'<div class="warn-box">{overfit["reason"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            f'<div class="success-box">✅ {overfit.get("reason", "Scores look healthy.")}</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    if overfit.get('train_score') is not None:
+                        oc1, oc2, oc3 = st.columns(3)
+                        oc1.metric("Train Score", f"{overfit['train_score']:.4f}")
+                        oc2.metric("CV Score", f"{overfit['cv_score']:.4f}")
+                        oc3.metric("Gap (overfit indicator)", f"{overfit.get('gap', 0):.4f}")
             else:
                 st.info("No model scores available.")
 
@@ -555,15 +578,59 @@ elif active_view == 'ml':
             profile = result.get('profile_report', {})
             if profile:
                 st.markdown("### Data Profile Summary")
-                st.json({
-                    'rows': profile.get('n_rows'),
-                    'columns': profile.get('n_cols'),
-                    'quality_score': profile.get('quality_score'),
-                    'target_column': result.get('target_column'),
-                    'task_type': result.get('task_type'),
-                    'column_types': profile.get('column_types'),
-                    'warnings': profile.get('warnings', [])
-                })
+                
+                # Basic info
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                pc1.metric("Rows", profile.get('n_rows', 'N/A'))
+                pc2.metric("Columns", profile.get('n_cols', 'N/A'))
+                pc3.metric("Quality Score", f"{profile.get('quality_score', 0)}/100")
+                pc4.metric("Task Type", result.get('task_type', 'N/A').title())
+                
+                st.markdown(f"**Target Column:** `{result.get('target_column', 'N/A')}`")
+                
+                # Column Types
+                col_types = profile.get('column_types', {})
+                if col_types:
+                    st.markdown("#### Column Types")
+                    ct_df = pd.DataFrame([
+                        {'Column': col, 'Type': ctype}
+                        for col, ctype in col_types.items()
+                    ])
+                    st.dataframe(ct_df, use_container_width=True, hide_index=True)
+                
+                # describe() Anomaly Detection
+                anomalies = profile.get('describe_anomalies', [])
+                if anomalies:
+                    st.markdown("### 🔍 Anomalies Detected (from describe() analysis)")
+                    st.markdown(
+                        '<div class="warn-box">'
+                        'These are unusual patterns found by analyzing descriptive statistics — '
+                        'just like a data scientist does with <code>df.describe()</code>.'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+                    anom_df = pd.DataFrame(anomalies)
+                    st.dataframe(anom_df, use_container_width=True, hide_index=True)
+                
+                # Uniformity Issues
+                uniformity = profile.get('uniformity_issues', {})
+                if uniformity:
+                    st.markdown("### 🔄 Non-Uniform Category Values Detected")
+                    for col, issues in uniformity.items():
+                        with st.expander(f"Column: `{col}` — {len(issues)} inconsistencies"):
+                            for canonical, variants in issues.items():
+                                st.write(f"  `{canonical}` has variants: {variants}")
+                    st.markdown(
+                        '<div class="info-box">✅ These have been automatically standardized by the Cleaner.</div>',
+                        unsafe_allow_html=True
+                    )
+                
+                # Warnings
+                warnings = profile.get('warnings', [])
+                if warnings:
+                    st.markdown("#### Warnings")
+                    for w in warnings:
+                        st.write(w)
             else:
                 st.info("No profile data available.")
 
@@ -572,11 +639,111 @@ elif active_view == 'ml':
             cleaning = result.get('cleaning_report', {})
             if cleaning:
                 st.markdown("### Cleaning Report")
+                
+                cc1, cc2, cc3 = st.columns(3)
                 dup = cleaning.get('duplicate_removal', {})
-                st.metric("Duplicates Removed", dup.get('rows_removed', 0))
-                st.json(cleaning)
+                cc1.metric("Duplicates Removed", dup.get('rows_removed', 0))
+                cc2.metric("Rows Remaining", dup.get('rows_remaining', 'N/A'))
+                cc3.metric("Columns Imputed", len(cleaning.get('missing_value_handling', {})))
+                
+                # Missing value handling details
+                mv = cleaning.get('missing_value_handling', {})
+                if mv:
+                    st.markdown("#### Missing Value Handling")
+                    mv_df = pd.DataFrame([
+                        {'Column': col, 'Strategy': info.get('strategy', 'N/A'),
+                         'Value': str(info.get('value', 'N/A'))}
+                        for col, info in mv.items()
+                    ])
+                    st.dataframe(mv_df, use_container_width=True, hide_index=True)
+                
+                # Outlier handling
+                outliers = cleaning.get('outlier_handling', {})
+                if outliers:
+                    st.markdown("#### Outlier Treatment (IQR Method)")
+                    out_df = pd.DataFrame([
+                        {'Column': col, 'N Outliers': info.get('n_outliers', 0),
+                         'Outlier %': info.get('outlier_pct', 0),
+                         'Action': info.get('action', 'N/A'),
+                         'Lower Bound': info.get('lower_bound', 'N/A'),
+                         'Upper Bound': info.get('upper_bound', 'N/A')}
+                        for col, info in outliers.items()
+                    ])
+                    st.dataframe(out_df, use_container_width=True, hide_index=True)
+                
+                # Category standardization
+                cat_std = cleaning.get('category_standardization', {})
+                if cat_std:
+                    st.markdown("#### Category Standardization")
+                    for col, mapping in cat_std.items():
+                        with st.expander(f"Column: `{col}`"):
+                            for old, new in mapping.items():
+                                st.write(f"  `{old}` → `{new}`")
             else:
                 st.info("No cleaning report available.")
+
+        # ── Features tab ──
+        with tab_features:
+            feat_report = result.get('feature_report', {})
+            if feat_report:
+                st.markdown("### Feature Engineering Report")
+                
+                # VIF Analysis
+                vif_info = feat_report.get('vif_analysis', {})
+                if vif_info:
+                    st.markdown("#### VIF Multicollinearity Analysis")
+                    st.markdown(
+                        '<div class="info-box">'
+                        '<b>Variance Inflation Factor (VIF)</b> measures multicollinearity. '
+                        'VIF &gt; 10 means the feature is highly correlated with others and should be removed. '
+                        f'Threshold used: {vif_info.get("threshold", 10)}'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+                    
+                    removed_vif = vif_info.get('removed_features', [])
+                    if removed_vif:
+                        st.markdown(f"**Removed {len(removed_vif)} features due to high VIF:**")
+                        vif_rm_df = pd.DataFrame(removed_vif)
+                        st.dataframe(vif_rm_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.success("All features have acceptable VIF — no multicollinearity issues.")
+                    
+                    final_vif = vif_info.get('final_vif_scores', {})
+                    if final_vif:
+                        st.markdown("#### Final VIF Scores (remaining features)")
+                        vif_df = pd.DataFrame([
+                            {'Feature': f, 'VIF': v}
+                            for f, v in sorted(final_vif.items(), key=lambda x: x[1], reverse=True)
+                        ])
+                        st.dataframe(vif_df, use_container_width=True, hide_index=True)
+                
+                # Encoding
+                encoding = feat_report.get('encoding', {})
+                if encoding:
+                    st.markdown("#### Encoding Applied")
+                    enc_df = pd.DataFrame([
+                        {'Column': col, 'Method': info.get('method', 'N/A'),
+                         'Unique Values': info.get('n_unique', 'N/A')}
+                        for col, info in encoding.items()
+                    ])
+                    st.dataframe(enc_df, use_container_width=True, hide_index=True)
+                
+                # Scaling
+                scaling = feat_report.get('scaling', {})
+                if scaling:
+                    st.markdown("#### Scaling")
+                    st.write(f"**Method:** {scaling.get('method', 'N/A')}")
+                    st.write(f"**Reason:** {scaling.get('reason', 'N/A')}")
+                    st.write(f"**Columns Scaled:** {scaling.get('n_columns', 0)}")
+                
+                # Dropped columns
+                dropped = feat_report.get('dropped_columns', [])
+                if dropped:
+                    st.markdown("#### Dropped Columns")
+                    st.write(f"ID columns removed: {dropped}")
+            else:
+                st.info("No feature engineering report available.")
 
         # ── Visualizations tab ──
         with tab_viz:
@@ -615,9 +782,190 @@ elif active_view == 'ml':
             else:
                 st.info("No explanations available.")
 
+        # ── Error Analysis tab ──
+        with tab_errors:
+            error_analysis = result.get('error_analysis', {})
+            if error_analysis and error_analysis.get('summary'):
+                st.markdown("### ⚠️ Error Analysis")
+                st.markdown(
+                    '<div class="info-box">'
+                    'Error analysis shows <b>where and why</b> the model makes mistakes — '
+                    'just like a real data scientist would investigate after training.'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                st.write(f"**Summary:** {error_analysis['summary']}")
+                
+                if result.get('task_type') == 'classification':
+                    # Class-level error rates
+                    class_errors = error_analysis.get('class_errors', [])
+                    if class_errors:
+                        st.markdown("#### Per-Class Error Rates")
+                        ce_df = pd.DataFrame(class_errors)
+                        st.dataframe(ce_df, use_container_width=True, hide_index=True)
+                    
+                    ec1, ec2 = st.columns(2)
+                    ec1.metric("Total Misclassified", error_analysis.get('total_errors', 'N/A'))
+                    ec2.metric("Error Rate", f"{error_analysis.get('error_rate', 0):.1f}%")
+                else:
+                    # Regression error metrics
+                    ec1, ec2, ec3 = st.columns(3)
+                    ec1.metric("MAE", f"{error_analysis.get('mae', 0):.4f}")
+                    ec2.metric("RMSE", f"{error_analysis.get('rmse', 0):.4f}")
+                    ec3.metric("Median Error", f"{error_analysis.get('median_error', 0):.4f}")
+                    
+                    # Error patterns
+                    patterns = error_analysis.get('error_patterns', [])
+                    if patterns:
+                        st.markdown("#### Error by Target Value Range")
+                        pat_df = pd.DataFrame(patterns)
+                        st.dataframe(pat_df, use_container_width=True, hide_index=True)
+                    
+                    # Worst predictions
+                    worst = error_analysis.get('worst_samples', [])
+                    if worst:
+                        st.markdown("#### Top 10 Worst Predictions")
+                        worst_df = pd.DataFrame(worst)
+                        st.dataframe(worst_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No error analysis available.")
+
+        # ── Segment Analysis tab ──
+        with tab_segments:
+            seg_analysis = result.get('segment_analysis', {})
+            if seg_analysis and seg_analysis.get('summary'):
+                st.markdown("### 📐 Model Segmentation Analysis")
+                st.markdown(
+                    '<div class="info-box">'
+                    'Segment analysis checks if the model performs <b>equally well across all data groups</b>. '
+                    'For example, does the model work for all age groups, or does it fail for age &lt; 25?'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                st.write(f"**Summary:** {seg_analysis['summary']}")
+                
+                # Problem segments highlighted
+                problems = seg_analysis.get('problem_segments', [])
+                if problems:
+                    st.markdown("#### ⚠️ Underperforming Segments")
+                    st.markdown(
+                        '<div class="warn-box">'
+                        'These segments have significantly worse performance than overall. '
+                        'Consider training separate models or adding more data for these groups.'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+                    prob_df = pd.DataFrame(problems)
+                    st.dataframe(prob_df[['column', 'segment', 'n_samples', 'score', 'overall_score', 'gap']],
+                                use_container_width=True, hide_index=True)
+                else:
+                    st.markdown(
+                        '<div class="success-box">✅ Model performs consistently across all segments.</div>',
+                        unsafe_allow_html=True
+                    )
+                
+                # All segments
+                all_segments = seg_analysis.get('segments', [])
+                if all_segments:
+                    with st.expander(f"View All {len(all_segments)} Segments"):
+                        seg_df = pd.DataFrame(all_segments)
+                        st.dataframe(seg_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No segment analysis available.")
+
+        # ── Predict Your Own Values tab ──
+        with tab_predict:
+            st.markdown("### 🎯 Predict With Your Own Values")
+            st.markdown(
+                '<div class="info-box">'
+                'Enter your own feature values below and the trained model will make a prediction. '
+                'This lets you test "what-if" scenarios.'
+                '</div>',
+                unsafe_allow_html=True
+            )
+            
+            feature_names = result.get('feature_names', [])
+            feature_report_data = result.get('feature_report', {})
+            
+            if feature_names and result.get('ensemble_model'):
+                st.markdown("#### Enter Feature Values")
+                
+                # Create input form
+                user_inputs = {}
+                n_cols_per_row = 3
+                
+                for i in range(0, len(feature_names), n_cols_per_row):
+                    cols = st.columns(n_cols_per_row)
+                    for j, col in enumerate(cols):
+                        feat_idx = i + j
+                        if feat_idx < len(feature_names):
+                            feat_name = feature_names[feat_idx]
+                            with col:
+                                user_inputs[feat_name] = st.number_input(
+                                    feat_name,
+                                    value=0.0,
+                                    format="%.4f",
+                                    key=f"predict_input_{feat_name}"
+                                )
+                
+                if st.button("🔮 Make Prediction", type="primary", use_container_width=True):
+                    try:
+                        import numpy as np_pred
+                        input_df = pd.DataFrame([user_inputs])
+                        
+                        # Ensure columns are in the right order
+                        input_df = input_df[feature_names]
+                        
+                        model = result['ensemble_model']
+                        prediction = model.predict(input_df)[0]
+                        
+                        # Decode prediction for classification
+                        encoders = result.get('encoders', {})
+                        task_type = result.get('task_type', '')
+                        display_prediction = prediction
+                        
+                        if task_type == 'classification' and 'target' in encoders:
+                            try:
+                                display_prediction = encoders['target'].inverse_transform([int(prediction)])[0]
+                            except Exception:
+                                display_prediction = prediction
+                        
+                        st.markdown("---")
+                        st.markdown(
+                            f'<div style="background:linear-gradient(135deg,#059669,#10B981);'
+                            f'border-radius:12px;padding:24px;text-align:center;color:white;">'
+                            f'<div style="font-size:1.2em;opacity:0.9;">Predicted Value</div>'
+                            f'<div style="font-size:2.5em;font-weight:800;">{display_prediction}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        
+                        # Show prediction confidence for classification
+                        if task_type == 'classification' and hasattr(model, 'predict_proba'):
+                            try:
+                                proba = model.predict_proba(input_df)[0]
+                                if 'target' in encoders:
+                                    classes = encoders['target'].classes_
+                                else:
+                                    classes = [f"Class {i}" for i in range(len(proba))]
+                                
+                                st.markdown("#### Prediction Confidence")
+                                prob_df = pd.DataFrame({
+                                    'Class': classes,
+                                    'Probability': [f"{p:.2%}" for p in proba]
+                                })
+                                st.dataframe(prob_df, use_container_width=True, hide_index=True)
+                            except Exception:
+                                pass
+                        
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+            else:
+                st.info("Train a model first (click **ML Prediction** above).")
+
         # Errors
         if result.get('errors'):
-            with st.expander("⚠️ Errors & Warnings"):
+            with st.expander("⚠️ Pipeline Errors & Warnings"):
                 for err in result['errors']:
                     st.warning(err)
     else:

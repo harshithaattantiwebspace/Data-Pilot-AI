@@ -73,6 +73,18 @@ class CleanerAgent(BaseAgent):
         df = self._fix_data_types(df, column_types)
         cleaning_report['transformations'].append('Fixed data types')
         
+        # =====================================================================
+        # Step 5: Standardize non-uniform categories
+        # =====================================================================
+        uniformity_issues = profile.get('uniformity_issues', {})
+        if uniformity_issues:
+            df, standardization_map = self._standardize_categories(df, column_types, uniformity_issues)
+            cleaning_report['category_standardization'] = standardization_map
+            if standardization_map:
+                self.log(f"Standardized categories in {len(standardization_map)} columns")
+        else:
+            cleaning_report['category_standardization'] = {}
+        
         # Update pipeline state
         state['current_data'] = df
         state['cleaning_report'] = cleaning_report
@@ -282,3 +294,49 @@ class CleanerAgent(BaseAgent):
                 self.log(f"  Warning: Could not convert {col} to {ctype}: {e}")
         
         return df
+    
+    # =========================================================================
+    # STEP 5: Standardize Non-Uniform Categories
+    # =========================================================================
+    
+    def _standardize_categories(self, df: pd.DataFrame, column_types: Dict[str, str],
+                                 uniformity_issues: Dict) -> tuple:
+        """
+        Standardize non-uniform category values detected by the Profiler.
+        
+        For example:
+          'Male', 'male', 'MALE'  →  'Male' (most frequent variant wins)
+          ' Yes ', 'Yes', 'yes'   →  'Yes'
+        
+        Args:
+            df: DataFrame to clean
+            column_types: column type mapping from profiler
+            uniformity_issues: {col: {canonical_lower: [variant1, variant2, ...]}}
+        
+        Returns:
+            Tuple of (cleaned DataFrame, standardization mapping applied)
+        """
+        standardization_map = {}
+        
+        for col, issues in uniformity_issues.items():
+            if col not in df.columns:
+                continue
+            
+            col_map = {}
+            for canonical, variants in issues.items():
+                # Pick the most common variant as the standard form
+                counts = {}
+                for v in variants:
+                    counts[v] = (df[col].astype(str) == v).sum()
+                standard = max(counts, key=counts.get)
+                
+                for v in variants:
+                    if v != standard:
+                        col_map[v] = standard
+            
+            if col_map:
+                df[col] = df[col].astype(str).replace(col_map)
+                standardization_map[col] = col_map
+                self.log(f"  {col}: Standardized {len(col_map)} variants → {list(set(col_map.values()))}")
+        
+        return df, standardization_map

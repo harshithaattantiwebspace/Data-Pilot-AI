@@ -77,6 +77,9 @@ class PipelineState(TypedDict, total=False):
     ensemble_score: float            # Ensemble CV score
     best_model_name: str             # Name of best single model
     model_recommendations: List      # [(model_name, confidence), ...] from RL
+    overfitting_analysis: Dict[str, Any]  # Overfitting detection results
+    error_analysis: Dict[str, Any]        # Error analysis (where model fails)
+    segment_analysis: Dict[str, Any]      # Performance by data segment
 
     # =====================================================================
     # VISUALIZER OUTPUTS
