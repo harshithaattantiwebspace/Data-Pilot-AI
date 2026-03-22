@@ -31,10 +31,19 @@ class CleanerAgent(BaseAgent):
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Clean the dataset"""
         self.log("Starting data cleaning...")
-        
+
         df = state['current_data'].copy()
         profile = state['profile_report']
         column_types = profile['column_types']
+
+        # Log LLM context hints so the team can see what the AI noticed
+        data_context = state.get('data_context', {})
+        if data_context:
+            self.log(f"Domain context: {data_context.get('domain', 'unknown')}")
+            cleaning_hints = data_context.get('cleaning_hints', {})
+            for col, hint in cleaning_hints.items():
+                if col in df.columns:
+                    self.log(f"  LLM hint for '{col}': {hint}")
         
         cleaning_report = {
             'missing_value_handling': {},

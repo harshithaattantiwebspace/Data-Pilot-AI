@@ -184,6 +184,23 @@ def run_explainer(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def run_context_analyzer(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Node 0: LLM context analysis — understands data BEFORE the ML pipeline starts."""
+    print(f"\n{'='*60}")
+    print("  STAGE 0/6: DATA CONTEXT ANALYSIS (LLM)")
+    print(f"{'='*60}")
+    start = time.time()
+    try:
+        state = data_analyzer_agent.execute_context_phase(state)
+    except Exception as e:
+        state.setdefault('errors', []).append(f"Context analysis failed: {e}")
+        print(f"  ERROR: {e}")
+        traceback.print_exc()
+    elapsed = time.time() - start
+    print(f"  Completed in {elapsed:.1f}s")
+    return state
+
+
 def run_data_analyzer(state: Dict[str, Any]) -> Dict[str, Any]:
     """Node: LLM-powered data analysis (for managers)."""
     print(f"\n{'='*60}")
@@ -214,10 +231,11 @@ def route_pipeline(state: Dict[str, Any]) -> str:
     run_mode = state.get('run_mode', 'ml_pipeline')
 
     if run_mode == 'data_analysis':
+        # Manager mode: go straight to data analyzer (no ML needed)
         return 'data_analyzer'
     else:
-        # Both 'ml_pipeline' and 'both' start with profiler
-        return 'profiler'
+        # ml_pipeline and both: start with LLM context analysis first
+        return 'context_analyzer'
 
 
 def route_after_explainer(state: Dict[str, Any]) -> str:
@@ -248,6 +266,7 @@ def build_pipeline_graph() -> StateGraph:
     graph = StateGraph(dict)
 
     # Add all nodes
+    graph.add_node("context_analyzer", run_context_analyzer)
     graph.add_node("profiler", run_profiler)
     graph.add_node("cleaner", run_cleaner)
     graph.add_node("feature", run_feature)
@@ -260,10 +279,13 @@ def build_pipeline_graph() -> StateGraph:
     graph.set_conditional_entry_point(
         route_pipeline,
         {
-            "profiler": "profiler",
+            "context_analyzer": "context_analyzer",
             "data_analyzer": "data_analyzer"
         }
     )
+
+    # Context analyzer feeds directly into profiler
+    graph.add_edge("context_analyzer", "profiler")
 
     # ML Pipeline edges (linear sequence)
     graph.add_edge("profiler", "cleaner")

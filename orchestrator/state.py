@@ -96,6 +96,7 @@ class PipelineState(TypedDict, total=False):
     # =====================================================================
     # DATA ANALYZER OUTPUTS
     # =====================================================================
+    data_context: Dict[str, Any]     # Phase 1 LLM context: {domain, suggested_target, task_type, cleaning_hints, feature_hints, ...}
     data_analysis: Dict[str, Any]    # {domain, summary, insights, charts, narratives, dashboard}
     analyzer_dir: str                # Path to data analysis output directory
 

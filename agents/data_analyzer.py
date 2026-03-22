@@ -122,6 +122,47 @@ RULES:
 - If the user asks about composition, use pie or treemap
 """
 
+CONTEXT_ANALYSIS_PROMPT = """You are an expert data scientist examining a new dataset for the first time.
+Your job is to understand what this data is about and guide the ML pipeline BEFORE any processing.
+
+DATASET INFO:
+- Name: {dataset_name}
+- Rows: {n_rows:,} | Columns: {n_cols}
+- Columns and sample values:
+{column_info}
+
+SAMPLE DATA (first 5 rows):
+{sample_data}
+
+BASIC STATISTICS:
+{statistics}
+
+YOUR TASK:
+Analyze this dataset like a senior data scientist seeing it for the first time.
+Identify the domain, the most likely ML target column, and cleaning considerations.
+
+RESPOND IN THIS EXACT JSON FORMAT (no other text):
+{{
+  "domain": "the business domain (e.g., healthcare, sales, HR, finance, education, e-commerce)",
+  "dataset_description": "one sentence describing what this dataset captures",
+  "suggested_target": "the most likely target column name for ML prediction",
+  "task_type": "classification or regression",
+  "target_reasoning": "brief reason why this is the target column",
+  "important_features": ["col1", "col2", "col3"],
+  "cleaning_hints": {{
+    "column_name": "specific cleaning note (e.g., 'zero means missing', 'outliers expected', 'case inconsistency')"
+  }},
+  "feature_hints": ["useful feature engineering idea 1", "idea 2"],
+  "business_context": "what business question this data helps answer"
+}}
+
+RULES:
+- Only suggest column names that ACTUALLY EXIST in the dataset
+- suggested_target must be a real column name from the dataset
+- cleaning_hints should only list columns that need special attention
+- task_type must be exactly 'classification' or 'regression'
+"""
+
 INSIGHT_NARRATIVE_PROMPT = """You are a business analyst writing a brief insight for a manager's dashboard.
 
 CHART: {chart_title}
@@ -262,6 +303,76 @@ class DataAnalyzerAgent(BaseAgent):
         state['analyzer_dir'] = analyzer_dir
 
         self.log(f"Data analysis complete! {len(charts)} charts generated in {analyzer_dir}")
+        return state
+
+    def execute_context_phase(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Phase 1 — runs FIRST in the pipeline, before Profiler/Cleaner.
+
+        Sends column names + sample rows to the LLM so it can understand the
+        dataset like a human would. Stores the result in state['data_context']
+        so every downstream agent can use it.
+
+        Also sets state['target_column'] automatically if the user didn't
+        specify one and the LLM finds a confident suggestion.
+        """
+        self.log("Analyzing data context — domain, target, and cleaning hints...")
+
+        df = state.get('raw_data')
+        if df is None:
+            self.log("No raw_data in state, skipping context phase.")
+            return state
+
+        dataset_name = state.get('dataset_name', 'Dataset')
+        profile = self._quick_profile(df)
+
+        # Build column info string
+        column_info_lines = []
+        for col, info in profile['columns'].items():
+            line = f"  - {col} ({info['dtype']}): {info['n_unique']} unique, missing={info['missing_pct']}%"
+            if info.get('mean') is not None:
+                line += f", range=[{info['min']}, {info['max']}], mean={info['mean']}"
+            else:
+                samples = ', '.join(info['sample_values'][:3])
+                line += f", examples: [{samples}]"
+            column_info_lines.append(line)
+        column_info = '\n'.join(column_info_lines)
+
+        sample_data = df.head(5).to_string(max_cols=15)
+        statistics = df.describe(include='all').to_string()
+
+        prompt = CONTEXT_ANALYSIS_PROMPT.format(
+            dataset_name=dataset_name,
+            n_rows=len(df),
+            n_cols=len(df.columns),
+            column_info=column_info,
+            sample_data=sample_data,
+            statistics=statistics
+        )
+
+        context = {}
+        try:
+            response = self.ask_llm(prompt)
+            context = self._parse_json_response(response) or {}
+        except Exception as e:
+            self.log(f"  Context analysis LLM call failed: {e}")
+
+        if context:
+            self.log(f"  Domain: {context.get('domain', 'unknown')}")
+            self.log(f"  Suggested target: {context.get('suggested_target', 'unknown')}")
+            self.log(f"  Task type: {context.get('task_type', 'unknown')}")
+
+            # Set target_column from LLM if user didn't specify one
+            if not state.get('target_column'):
+                suggested = context.get('suggested_target')
+                if suggested and suggested in df.columns:
+                    state['target_column'] = suggested
+                    self.log(f"  Set target_column = '{suggested}' (LLM-detected)")
+        else:
+            self.log("  Context analysis returned no results, pipeline will use defaults.")
+
+        state['data_context'] = context
+        state['stage'] = 'context_analyzed'
         return state
 
     def analyze_with_prompt(self, df: pd.DataFrame, user_prompt: str,

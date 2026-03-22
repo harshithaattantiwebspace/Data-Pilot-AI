@@ -39,18 +39,28 @@ class ProfilerAgent(BaseAgent):
         
         df = state['raw_data']
         target_col = state.get('target_column')
-        
+        data_context = state.get('data_context', {})
+
         # Step 1: Detect column types
         column_types = self._detect_column_types(df)
         self.log(f"Detected column types: {column_types}")
-        
+
         # Step 2: Auto-detect target if not specified
+        # LLM context already set target_column in state during context phase,
+        # so this fallback only runs if context phase failed or returned nothing.
         if not target_col:
             target_col = self._detect_target(df, column_types)
             self.log(f"Auto-detected target column: {target_col}")
-        
+        else:
+            self.log(f"Using target column: {target_col}")
+
         # Step 3: Determine task type (classification or regression)
         task_type = self._determine_task_type(df, target_col, column_types)
+        # Override with LLM-suggested task type if valid
+        llm_task_type = data_context.get('task_type', '').lower()
+        if llm_task_type in ('classification', 'regression') and llm_task_type != task_type:
+            self.log(f"Task type overridden by LLM context: {task_type} → {llm_task_type}")
+            task_type = llm_task_type
         self.log(f"Task type: {task_type}")
         
         # Step 4: Compute per-column statistics
