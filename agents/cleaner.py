@@ -223,7 +223,7 @@ class CleanerAgent(BaseAgent):
         Impute datetime column using forward-fill then backward-fill.
         This preserves temporal ordering.
         """
-        df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
+        df[col] = df[col].ffill().bfill()
         return {'strategy': 'forward_backward_fill'}
     
     # =========================================================================
@@ -346,6 +346,6 @@ class CleanerAgent(BaseAgent):
             if col_map:
                 df[col] = df[col].astype(str).replace(col_map)
                 standardization_map[col] = col_map
-                self.log(f"  {col}: Standardized {len(col_map)} variants → {list(set(col_map.values()))}")
+                self.log(f"  {col}: Standardized {len(col_map)} variants -> {list(set(col_map.values()))}")
         
         return df, standardization_map

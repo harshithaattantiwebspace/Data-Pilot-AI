@@ -3,15 +3,9 @@
 import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Tuple
-from scipy import stats
 from sklearn.preprocessing import LabelEncoder
-from sklearn.decomposition import PCA
-from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
-from sklearn.naive_bayes import GaussianNB
-from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge
-from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.model_selection import cross_val_score
 from agents.base import BaseAgent
+from meta_features import extract_meta_features, N_META_FEATURES
 
 
 class ProfilerAgent(BaseAgent):
@@ -23,7 +17,7 @@ class ProfilerAgent(BaseAgent):
       2. Auto-detection of target column (if user didn't specify)
       3. Task type determination (classification vs regression)
       4. Per-column statistics (mean, std, skewness, missing %, etc.)
-      5. 32 meta-features for the RL Model Selector
+      5. 40 meta-features for the RL Model Selector
       6. Data quality score (0-100)
       7. Warnings about potential data issues
     
@@ -59,15 +53,15 @@ class ProfilerAgent(BaseAgent):
         # Override with LLM-suggested task type if valid
         llm_task_type = data_context.get('task_type', '').lower()
         if llm_task_type in ('classification', 'regression') and llm_task_type != task_type:
-            self.log(f"Task type overridden by LLM context: {task_type} → {llm_task_type}")
+            self.log(f"Task type overridden by LLM context: {task_type} -> {llm_task_type}")
             task_type = llm_task_type
         self.log(f"Task type: {task_type}")
         
         # Step 4: Compute per-column statistics
         statistics = self._compute_statistics(df, column_types)
         
-        # Step 5: Extract 32 meta-features for RL Model Selector
-        meta_features = self._extract_meta_features(df, target_col, task_type, column_types)
+        # Step 5: Extract 40 meta-features for RL Model Selector
+        meta_features = self._extract_meta_features(df, target_col, task_type)
         self.log(f"Extracted {len(meta_features)} meta-features")
         
         # Step 6: Compute data quality score
@@ -132,8 +126,8 @@ class ProfilerAgent(BaseAgent):
             # Check if datetime
             if dtype == 'datetime64[ns]':
                 column_types[col] = 'datetime'
-            # Check if numeric
-            elif dtype in ['int64', 'float64']:
+            # Check if numeric (any int or float dtype)
+            elif pd.api.types.is_numeric_dtype(df[col]):
                 # Could be categorical if very few unique values relative to dataset
                 if n_unique <= 20 and unique_ratio < 0.05:
                     column_types[col] = 'categorical'
@@ -264,234 +258,39 @@ class ProfilerAgent(BaseAgent):
         return statistics
     
     # =========================================================================
-    # STEP 5: Extract 32 Meta-Features for RL Model Selector
+    # STEP 5: Extract 40 Meta-Features for RL Model Selector
     # =========================================================================
-    
+
     def _extract_meta_features(self, df: pd.DataFrame, target_col: str,
-                               task_type: str, column_types: Dict[str, str]) -> np.ndarray:
+                               task_type: str) -> np.ndarray:
         """
-        Extract exactly 32 normalized meta-features that describe the dataset.
+        Extract exactly 40 normalized meta-features that describe the dataset.
         These are fed into the PPO RL agent to select the best ML model.
-        
-        Feature groups:
-          [0-5]   Basic features (size, dimensionality)
-          [6-8]   Missing value features
-          [9-18]  Statistical features (skew, kurtosis, outliers, correlation)
-          [19-21] Categorical features (cardinality)
-          [22-24] Target features (imbalance, skew, kurtosis)
-          [25-27] PCA features (intrinsic dimensionality)
-          [28-31] Landmark features (quick model scores)
+
+        Delegates to the shared meta_features.extract_meta_features() which
+        produces IDENTICAL output to the training script in RL_MODEL_PPO_CORRECT.
+
+        Feature groups (40 total):
+          [0-5]   Basic (6)       : shape, type ratios, dimensionality
+          [6-8]   Missing (3)     : patterns of missing data
+          [9-18]  Statistical (10): distribution properties
+          [19-21] Categorical (3) : cardinality of categorical columns
+          [22-24] Target (3)      : target variable properties
+          [25-27] PCA (3)         : intrinsic dimensionality via PCA
+          [28-31] Landmarks (4)   : quick 3-fold CV scores
+          [32-39] Signal (8)      : sparsity, correlations, nonlinearity
         """
-        features = []
-        
-        # Separate features and target
         X = df.drop(columns=[target_col])
         y = df[target_col]
-        
-        # Get numeric and categorical columns
-        numeric_cols = [c for c in X.columns if column_types.get(c) == 'numeric']
-        categorical_cols = [c for c in X.columns if column_types.get(c) == 'categorical']
-        
-        X_numeric = X[numeric_cols].fillna(X[numeric_cols].median()) if numeric_cols else pd.DataFrame()
-        
-        # === BASIC FEATURES (6) — indices [0-5] ===
-        n_samples = len(df)
-        n_features = len(X.columns)
-        
-        features.append(np.log10(n_samples + 1) / 6)           # [0] n_samples (log-normalized)
-        features.append(np.log10(n_features + 1) / 4)          # [1] n_features (log-normalized)
-        features.append(len(numeric_cols) / max(n_features, 1)) # [2] numeric ratio
-        features.append(len(categorical_cols) / max(n_features, 1))  # [3] categorical ratio
-        
-        if task_type == 'classification':
-            features.append(y.nunique() / 100)                  # [4] n_classes (normalized)
-        else:
-            features.append(0)
-        
-        features.append(n_features / max(n_samples, 1))        # [5] dimensionality ratio
-        
-        # === MISSING VALUE FEATURES (3) — indices [6-8] ===
-        missing_ratio = df.isna().sum().sum() / (n_samples * len(df.columns))
-        cols_with_missing = (df.isna().sum() > 0).sum() / len(df.columns)
-        max_missing = df.isna().mean().max()
-        
-        features.append(missing_ratio)                          # [6] overall missing ratio
-        features.append(cols_with_missing)                      # [7] fraction of cols with missing
-        features.append(max_missing)                            # [8] worst column missing ratio
-        
-        # === STATISTICAL FEATURES (10) — indices [9-18] ===
-        if len(X_numeric.columns) > 0:
-            skewness = X_numeric.skew()
-            kurtosis = X_numeric.kurtosis()
-            
-            features.append(np.clip(skewness.mean(), -10, 10) / 10)     # [9] mean skewness
-            features.append(np.clip(kurtosis.mean(), -100, 100) / 100)  # [10] mean kurtosis
-            
-            # Outlier ratio (IQR method)
-            Q1 = X_numeric.quantile(0.25)
-            Q3 = X_numeric.quantile(0.75)
-            IQR = Q3 - Q1
-            outliers = ((X_numeric < Q1 - 1.5 * IQR) | (X_numeric > Q3 + 1.5 * IQR)).sum().sum()
-            features.append(outliers / (n_samples * len(X_numeric.columns)))  # [11] outlier ratio
-            
-            # Mean absolute correlation
-            if len(X_numeric.columns) > 1:
-                corr = X_numeric.corr().abs()
-                features.append(corr.values[np.triu_indices_from(corr.values, 1)].mean())  # [12]
-            else:
-                features.append(0)
-            
-            # Coefficient of variation
-            cv = X_numeric.std() / (X_numeric.mean().abs() + 1e-10)
-            features.append(np.clip(cv.mean(), 0, 10) / 10)    # [13] cv mean
-            features.append(np.clip(cv.std(), 0, 10) / 10)     # [14] cv std
-            
-            features.append(np.clip(skewness.std(), 0, 10) / 10)       # [15] skew std
-            features.append(np.clip(kurtosis.std(), 0, 100) / 100)     # [16] kurtosis std
-            
-            # Range ratio
-            ranges = (X_numeric.max() - X_numeric.min()) / (X_numeric.std() + 1e-10)
-            features.append(np.clip(ranges.mean(), 0, 100) / 100)      # [17] range ratio
-            
-            # Zero ratio
-            features.append((X_numeric == 0).sum().sum() / (n_samples * len(X_numeric.columns)))  # [18]
-        else:
-            features.extend([0] * 10)
-        
-        # === CATEGORICAL FEATURES (3) — indices [19-21] ===
-        if len(categorical_cols) > 0:
-            cardinalities = [df[c].nunique() for c in categorical_cols]
-            features.append(np.mean(cardinalities) / 100)               # [19] mean cardinality
-            features.append(np.max(cardinalities) / 1000)               # [20] max cardinality
-            features.append(sum(1 for c in cardinalities if c > 20) / len(categorical_cols))  # [21]
-        else:
-            features.extend([0, 0, 0])
-        
-        # === TARGET FEATURES (3) — indices [22-24] ===
-        if task_type == 'classification':
-            value_counts = y.value_counts(normalize=True)
-            features.append(1 - value_counts.max())                     # [22] class imbalance
-            features.append(0)                                          # [23] n/a for classification
-            features.append(0)                                          # [24] n/a for classification
-        else:
-            y_numeric = pd.to_numeric(y, errors='coerce').dropna()
-            if len(y_numeric) > 0:
-                features.append(0)                                      # [22] n/a for regression
-                features.append(np.clip(y_numeric.skew(), -10, 10) / 10)    # [23] target skewness
-                features.append(np.clip(y_numeric.kurtosis(), -100, 100) / 100)  # [24] target kurtosis
-            else:
-                features.extend([0, 0, 0])
-        
-        # === PCA FEATURES (3) — indices [25-27] ===
-        if len(X_numeric.columns) > 1:
-            try:
-                X_scaled = (X_numeric - X_numeric.mean()) / (X_numeric.std() + 1e-10)
-                X_scaled = X_scaled.fillna(0)
-                
-                pca = PCA()
-                pca.fit(X_scaled)
-                
-                cumvar = np.cumsum(pca.explained_variance_ratio_)
-                n_95 = np.argmax(cumvar >= 0.95) + 1
-                var_50 = cumvar[min(len(cumvar) - 1, int(len(cumvar) * 0.5))]
-                
-                features.append(n_95 / len(X_numeric.columns))         # [25] components for 95% var
-                features.append(var_50)                                 # [26] variance at 50% components
-                features.append(n_95 / max(n_samples, 1))              # [27] intrinsic dimensionality
-            except:
-                features.extend([0.5, 0.5, 0.01])
-        else:
-            features.extend([1.0, 1.0, 0.01])
-        
-        # === LANDMARK FEATURES (4) — indices [28-31] ===
-        landmarks = self._compute_landmarks(X_numeric, y, task_type)
-        features.extend(landmarks)
-        
-        # Ensure exactly 32 features
-        features = features[:32]
-        while len(features) < 32:
-            features.append(0)
-        
-        return np.array(features, dtype=np.float32)
-    
-    def _compute_landmarks(self, X: pd.DataFrame, y: pd.Series,
-                          task_type: str) -> List[float]:
-        """
-        Compute "landmark" scores — quick cross-validation of simple models.
-        These tell the RL agent how the dataset responds to different model families:
-          [0] Decision Tree score
-          [1] Naive Bayes / Linear Regression score
-          [2] Logistic Regression / Ridge score
-          [3] KNN score
-        """
-        if len(X.columns) == 0 or len(X) < 50:
-            return [0.5, 0.5, 0.5, 0.5]
-        
-        landmarks = []
-        
-        # Sample data for speed (max 1000 rows)
-        sample_size = min(1000, len(X))
-        idx = np.random.choice(len(X), sample_size, replace=False)
-        X_sample = X.iloc[idx].values
-        y_sample = y.iloc[idx]
-        
-        # Encode target if classification
+
+        # Encode target for landmark models if classification
         if task_type == 'classification':
             le = LabelEncoder()
-            y_sample = le.fit_transform(y_sample.astype(str))
+            y_encoded = pd.Series(le.fit_transform(y.astype(str)), name=y.name)
         else:
-            y_sample = pd.to_numeric(y_sample, errors='coerce').fillna(0).values
-        
-        scoring = 'accuracy' if task_type == 'classification' else 'r2'
-        
-        # Landmark 1: Decision Tree (max_depth=3 for speed)
-        try:
-            if task_type == 'classification':
-                dt = DecisionTreeClassifier(max_depth=3, random_state=42)
-            else:
-                dt = DecisionTreeRegressor(max_depth=3, random_state=42)
-            score = cross_val_score(dt, X_sample, y_sample, cv=3, scoring=scoring)
-            landmarks.append(np.clip(score.mean(), 0, 1))
-        except:
-            landmarks.append(0.5)
-        
-        # Landmark 2: Naive Bayes (classification) / Linear Regression (regression)
-        try:
-            if task_type == 'classification':
-                model = GaussianNB()
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='accuracy')
-            else:
-                model = LinearRegression()
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='r2')
-            landmarks.append(np.clip(score.mean(), 0, 1))
-        except:
-            landmarks.append(0.5)
-        
-        # Landmark 3: Logistic Regression (classification) / Ridge (regression)
-        try:
-            if task_type == 'classification':
-                model = LogisticRegression(max_iter=100, random_state=42)
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='accuracy')
-            else:
-                model = Ridge(random_state=42)
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='r2')
-            landmarks.append(np.clip(score.mean(), 0, 1))
-        except:
-            landmarks.append(0.5)
-        
-        # Landmark 4: K-Nearest Neighbors
-        try:
-            if task_type == 'classification':
-                model = KNeighborsClassifier(n_neighbors=3)
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='accuracy')
-            else:
-                model = KNeighborsRegressor(n_neighbors=3)
-                score = cross_val_score(model, X_sample, y_sample, cv=3, scoring='r2')
-            landmarks.append(np.clip(score.mean(), 0, 1))
-        except:
-            landmarks.append(0.5)
-        
-        return landmarks
+            y_encoded = pd.to_numeric(y, errors='coerce').fillna(0)
+
+        return extract_meta_features(X, y_encoded, task_type)
     
     # =========================================================================
     # STEP 6: Data Quality Score

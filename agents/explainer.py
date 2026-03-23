@@ -702,14 +702,14 @@ class ExplainerAgent(BaseAgent):
 
             # Build SHAP explanation string
             shap_explanation = ""
-            if shap_values is not None:
+            if shap_values is not None and idx < len(shap_values):
                 sample_shap = shap_values[idx]
                 sorted_idx = np.argsort(np.abs(sample_shap))[::-1][:5]
                 for si in sorted_idx:
                     feat = X.columns[si]
                     sv = sample_shap[si]
                     direction = "increases" if sv > 0 else "decreases"
-                    shap_explanation += f"  - {feat} = {row.iloc[si]:.2f} → {direction} prediction (SHAP: {sv:+.4f})\n"
+                    shap_explanation += f"  - {feat} = {row.iloc[si]:.2f} -> {direction} prediction (SHAP: {sv:+.4f})\n"
             else:
                 shap_explanation = "  (SHAP not available for this model)"
 

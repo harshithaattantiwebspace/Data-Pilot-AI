@@ -54,8 +54,13 @@ class BaseAgent(ABC):
     def log(self, message: str):
         """
         Log agent activity with agent name prefix.
-        
+
         Args:
             message: The log message to print.
         """
-        print(f"[{self.name}] {message}")
+        try:
+            print(f"[{self.name}] {message}")
+        except UnicodeEncodeError:
+            # Windows cp1252 can't handle some Unicode chars — strip them
+            safe = message.encode('ascii', errors='replace').decode('ascii')
+            print(f"[{self.name}] {safe}")

@@ -163,7 +163,7 @@ class FeatureAgent(BaseAgent):
                     'n_unique': n_unique,
                     'new_cols': dummies.columns.tolist()
                 }
-                self.log(f"  {col}: One-hot encoded ({n_unique} values → {len(dummies.columns)} columns)")
+                self.log(f"  {col}: One-hot encoded ({n_unique} values -> {len(dummies.columns)} columns)")
             
             else:
                 # High cardinality → Target encoding
@@ -210,11 +210,11 @@ class FeatureAgent(BaseAgent):
         if skewness > 1:
             scaler = RobustScaler()
             method = 'robust'
-            reason = f'Mean absolute skewness = {skewness:.2f} (>1) → using RobustScaler'
+            reason = f'Mean absolute skewness = {skewness:.2f} (>1) -> using RobustScaler'
         else:
             scaler = StandardScaler()
             method = 'standard'
-            reason = f'Mean absolute skewness = {skewness:.2f} (≤1) → using StandardScaler'
+            reason = f'Mean absolute skewness = {skewness:.2f} (<=1) -> using StandardScaler'
         
         X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
         self.scalers['numeric'] = scaler

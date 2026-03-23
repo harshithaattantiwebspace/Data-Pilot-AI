@@ -9,7 +9,6 @@ from sklearn.ensemble import (
     ExtraTreesClassifier, ExtraTreesRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor,
     VotingClassifier, VotingRegressor,
-    StackingClassifier, StackingRegressor
 )
 from sklearn.linear_model import (
     LogisticRegression, Ridge, Lasso, ElasticNet
@@ -17,9 +16,29 @@ from sklearn.linear_model import (
 from sklearn.svm import SVC, SVR
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.naive_bayes import GaussianNB
-from xgboost import XGBClassifier, XGBRegressor
-from lightgbm import LGBMClassifier, LGBMRegressor
-from catboost import CatBoostClassifier, CatBoostRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# Optional boosting libraries — not required for RL-recommended sklearn models
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+    _HAS_XGB = True
+except ImportError:
+    _HAS_XGB = False
+
+try:
+    from lightgbm import LGBMClassifier, LGBMRegressor
+    _HAS_LGBM = True
+except ImportError:
+    _HAS_LGBM = False
+
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    _HAS_CB = True
+except ImportError:
+    _HAS_CB = False
+
 from rl_selector.inference import RLModelSelector
 from agents.base import BaseAgent
 
@@ -49,34 +68,42 @@ class ModelerAgent(BaseAgent):
     
     def _get_model_classes(self) -> Dict:
         """
-        Map model name strings to their actual scikit-learn/xgboost/lightgbm classes.
-        This allows us to instantiate any model by just knowing its name.
+        Map model name strings to their actual scikit-learn classes.
+        The RL model recommends from sklearn models (8 clf, 9 reg).
+        XGBoost/LightGBM/CatBoost are added when available as extras.
         """
-        return {
-            # === Classification Models ===
-            'XGBClassifier': XGBClassifier,
-            'LGBMClassifier': LGBMClassifier,
-            'CatBoostClassifier': CatBoostClassifier,
+        classes = {
+            # === Classification Models (all 8 that RL knows about) ===
+            'LogisticRegression': LogisticRegression,
+            'GaussianNB': GaussianNB,
+            'KNeighborsClassifier': KNeighborsClassifier,
+            'SVC': SVC,
+            'DecisionTreeClassifier': DecisionTreeClassifier,
             'RandomForestClassifier': RandomForestClassifier,
             'ExtraTreesClassifier': ExtraTreesClassifier,
             'GradientBoostingClassifier': GradientBoostingClassifier,
-            'LogisticRegression': LogisticRegression,
-            'SVC': SVC,
-            'KNeighborsClassifier': KNeighborsClassifier,
-            'GaussianNB': GaussianNB,
-            # === Regression Models ===
-            'XGBRegressor': XGBRegressor,
-            'LGBMRegressor': LGBMRegressor,
-            'CatBoostRegressor': CatBoostRegressor,
-            'RandomForestRegressor': RandomForestRegressor,
-            'ExtraTreesRegressor': ExtraTreesRegressor,
-            'GradientBoostingRegressor': GradientBoostingRegressor,
+            # === Regression Models (all 9 that RL knows about) ===
             'Ridge': Ridge,
             'Lasso': Lasso,
             'ElasticNet': ElasticNet,
             'SVR': SVR,
             'KNeighborsRegressor': KNeighborsRegressor,
+            'DecisionTreeRegressor': DecisionTreeRegressor,
+            'RandomForestRegressor': RandomForestRegressor,
+            'ExtraTreesRegressor': ExtraTreesRegressor,
+            'GradientBoostingRegressor': GradientBoostingRegressor,
         }
+        # Optional boosting libraries
+        if _HAS_XGB:
+            classes['XGBClassifier'] = XGBClassifier
+            classes['XGBRegressor'] = XGBRegressor
+        if _HAS_LGBM:
+            classes['LGBMClassifier'] = LGBMClassifier
+            classes['LGBMRegressor'] = LGBMRegressor
+        if _HAS_CB:
+            classes['CatBoostClassifier'] = CatBoostClassifier
+            classes['CatBoostRegressor'] = CatBoostRegressor
+        return classes
     
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Train models and create ensemble"""
@@ -93,7 +120,7 @@ class ModelerAgent(BaseAgent):
         recommendations = self.rl_selector.recommend(meta_features, task_type, top_k=3)
         self.log(f"RL recommendations:")
         for model_name, confidence in recommendations:
-            self.log(f"  → {model_name} (confidence: {confidence:.1%})")
+            self.log(f"  - {model_name} (confidence: {confidence:.1%})")
         
         # =====================================================================
         # Step 2: Train each recommended model with 5-fold CV
@@ -107,9 +134,9 @@ class ModelerAgent(BaseAgent):
                 model, score = self._train_model(model_name, X, y, task_type)
                 trained_models[model_name] = model
                 cv_scores[model_name] = score
-                self.log(f"  ✓ {model_name} CV score: {score:.4f}")
+                self.log(f"  [OK] {model_name} CV score: {score:.4f}")
             except Exception as e:
-                self.log(f"  ✗ {model_name} failed: {e}")
+                self.log(f"  [FAIL] {model_name} failed: {e}")
         
         # Safety check: need at least 1 trained model
         if len(trained_models) == 0:
@@ -132,7 +159,7 @@ class ModelerAgent(BaseAgent):
         try:
             ensemble_cv = cross_val_score(ensemble_model, X, y, cv=5, scoring=scoring)
             ensemble_score = ensemble_cv.mean()
-            self.log(f"Ensemble CV score: {ensemble_score:.4f} (±{ensemble_cv.std():.4f})")
+            self.log(f"Ensemble CV score: {ensemble_score:.4f} (+/-{ensemble_cv.std():.4f})")
         except Exception as e:
             self.log(f"Ensemble CV failed ({e}), using mean of individual scores")
             ensemble_score = np.mean(list(cv_scores.values()))
@@ -305,9 +332,15 @@ class ModelerAgent(BaseAgent):
             'LogisticRegression': {
                 'max_iter': 1000, 'random_state': 42
             },
-            'Ridge': {'random_state': 42},
-            'Lasso': {'random_state': 42},
-            'ElasticNet': {'random_state': 42},
+            'DecisionTreeClassifier': {
+                'random_state': 42
+            },
+            'DecisionTreeRegressor': {
+                'random_state': 42
+            },
+            'Ridge': {'alpha': 1.0},
+            'Lasso': {'alpha': 1.0},
+            'ElasticNet': {'alpha': 1.0},
             # --- Distance/kernel models ---
             'SVC': {'probability': True, 'random_state': 42},
             'SVR': {},
