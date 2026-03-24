@@ -497,11 +497,22 @@ class VisualizerAgent(BaseAgent):
         task_type = state.get('task_type', 'classification')
         feature_report = state.get('feature_report', {})
 
+        # Guard: keep only numeric columns to avoid datetime/bool errors
+        if isinstance(X, pd.DataFrame):
+            numeric_X_cols = [
+                col for col in X.columns
+                if not pd.api.types.is_datetime64_any_dtype(X[col])
+                and not pd.api.types.is_timedelta64_dtype(X[col])
+                and (pd.api.types.is_numeric_dtype(X[col])
+                     or pd.api.types.is_bool_dtype(X[col]))
+            ]
+            X = X[numeric_X_cols]
+
         # --- 3.1 Feature Correlation Heatmap ---
         if isinstance(X, pd.DataFrame) and len(X.columns) > 1:
             n_features_plot = min(20, len(X.columns))
             # Pick features with highest variance for the heatmap
-            variances = X.var().sort_values(ascending=False)
+            variances = X.select_dtypes(include=[np.number]).var().sort_values(ascending=False)
             top_features = variances.head(n_features_plot).index.tolist()
 
             corr_matrix = X[top_features].corr()

@@ -108,26 +108,59 @@ class ModelerAgent(BaseAgent):
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Train models and create ensemble"""
         self.log("Starting model training...")
-        
+
         X = state['X']
         y = state['y']
         task_type = state['task_type']
-        meta_features = state['meta_features']
-        
+        meta_features = state.get('meta_features')
+
+        # Ensure X is fully numeric float64 — last-resort guard.
+        # Use explicit dtype checks (more reliable than try/except astype across
+        # pandas/numpy versions where DTypePromotionError may not be TypeError).
+        X = X.copy()
+        cols_to_drop = []
+        for col in list(X.columns):
+            if (pd.api.types.is_datetime64_any_dtype(X[col]) or
+                    pd.api.types.is_timedelta64_dtype(X[col])):
+                cols_to_drop.append(col)
+            elif pd.api.types.is_bool_dtype(X[col]):
+                X[col] = X[col].astype(np.float64)
+            elif pd.api.types.is_numeric_dtype(X[col]):
+                X[col] = X[col].astype(np.float64)
+            else:
+                cols_to_drop.append(col)
+        if cols_to_drop:
+            X = X.drop(columns=cols_to_drop)
+            self.log(f"Dropped {len(cols_to_drop)} non-numeric columns before training: {cols_to_drop}")
+        X = X.fillna(0).replace([float('inf'), float('-inf')], 0)
+
+        if X.shape[1] == 0:
+            raise ValueError("No numeric features left after cleaning — cannot train.")
+
+        self.log(f"Feature matrix: {X.shape[0]} rows x {X.shape[1]} cols, all float64")
+
         # =====================================================================
-        # Step 1: Ask RL Model Selector for top-3 recommendations
+        # Step 1: Get RL recommendations (or use defaults if meta_features missing)
         # =====================================================================
-        recommendations = self.rl_selector.recommend(meta_features, task_type, top_k=3)
-        self.log(f"RL recommendations:")
+        if meta_features is not None:
+            try:
+                recommendations = self.rl_selector.recommend(meta_features, task_type, top_k=3)
+            except Exception as e:
+                self.log(f"RL selector failed ({e}), using defaults")
+                recommendations = self.rl_selector._default_recommendations(task_type)
+        else:
+            recommendations = self.rl_selector._default_recommendations(task_type)
+
+        self.log("RL recommendations:")
         for model_name, confidence in recommendations:
             self.log(f"  - {model_name} (confidence: {confidence:.1%})")
-        
+
         # =====================================================================
         # Step 2: Train each recommended model with 5-fold CV
         # =====================================================================
         trained_models = {}
         cv_scores = {}
-        
+
         for model_name, confidence in recommendations:
             self.log(f"Training {model_name}...")
             try:
@@ -137,38 +170,83 @@ class ModelerAgent(BaseAgent):
                 self.log(f"  [OK] {model_name} CV score: {score:.4f}")
             except Exception as e:
                 self.log(f"  [FAIL] {model_name} failed: {e}")
-        
-        # Safety check: need at least 1 trained model
-        if len(trained_models) == 0:
-            self.log("All recommended models failed! Falling back to RandomForest...")
-            fallback_name = 'RandomForestClassifier' if task_type == 'classification' else 'RandomForestRegressor'
-            model, score = self._train_model(fallback_name, X, y, task_type)
-            trained_models[fallback_name] = model
-            cv_scores[fallback_name] = score
-        
+
         # =====================================================================
-        # Step 3: Create Voting Ensemble (combines all trained models)
+        # Fallback cascade: try progressively simpler models until one works
+        # =====================================================================
+        if len(trained_models) == 0:
+            fallbacks_clf = ['RandomForestClassifier', 'DecisionTreeClassifier', 'GaussianNB', 'LogisticRegression']
+            fallbacks_reg = ['RandomForestRegressor', 'DecisionTreeRegressor', 'Ridge', 'Lasso']
+            fallbacks = fallbacks_clf if task_type == 'classification' else fallbacks_reg
+
+            for fb_name in fallbacks:
+                try:
+                    self.log(f"Trying fallback: {fb_name}...")
+                    model, score = self._train_model(fb_name, X, y, task_type)
+                    trained_models[fb_name] = model
+                    cv_scores[fb_name] = score
+                    self.log(f"  [OK] fallback {fb_name} CV score: {score:.4f}")
+                    break
+                except Exception as e:
+                    self.log(f"  [FAIL] fallback {fb_name}: {e}")
+
+        if len(trained_models) == 0:
+            raise RuntimeError(
+                "All models failed to train. Check that your feature columns are numeric "
+                "and the target column has valid values."
+            )
+
+        # =====================================================================
+        # Step 3: Build ensemble from trained models
+        # VotingClassifier soft voting requires predict_proba.
+        # Filter to only models that support it, fall back to hard/mean voting.
         # =====================================================================
         self.log("Creating ensemble...")
-        ensemble_model = self._create_ensemble(trained_models, task_type)
-        
+
+        if task_type == 'classification':
+            # Only include models with predict_proba for soft voting
+            soft_estimators = [(n, m) for n, m in trained_models.items()
+                               if hasattr(m, 'predict_proba')]
+            if len(soft_estimators) >= 2:
+                ensemble_model = VotingClassifier(estimators=soft_estimators, voting='soft')
+            elif len(soft_estimators) == 1:
+                # Only one model with predict_proba — use hard voting with all
+                all_estimators = list(trained_models.items())
+                ensemble_model = VotingClassifier(estimators=all_estimators, voting='hard')
+            else:
+                all_estimators = list(trained_models.items())
+                ensemble_model = VotingClassifier(estimators=all_estimators, voting='hard')
+        else:
+            ensemble_model = VotingRegressor(estimators=list(trained_models.items()))
+
+        self.log(f"Created {'VotingClassifier' if task_type == 'classification' else 'VotingRegressor'} "
+                 f"with {len(trained_models)} models: {list(trained_models.keys())}")
+
         # =====================================================================
         # Step 4: Evaluate ensemble with cross-validation
         # =====================================================================
         scoring = 'accuracy' if task_type == 'classification' else 'r2'
         try:
-            ensemble_cv = cross_val_score(ensemble_model, X, y, cv=5, scoring=scoring)
-            ensemble_score = ensemble_cv.mean()
+            ensemble_cv = cross_val_score(ensemble_model, X, y, cv=5, scoring=scoring,
+                                          error_score=0.0)
+            ensemble_score = float(ensemble_cv.mean())
             self.log(f"Ensemble CV score: {ensemble_score:.4f} (+/-{ensemble_cv.std():.4f})")
         except Exception as e:
-            self.log(f"Ensemble CV failed ({e}), using mean of individual scores")
-            ensemble_score = np.mean(list(cv_scores.values()))
-        
+            self.log(f"Ensemble CV failed ({e}), using mean of individual CV scores")
+            ensemble_score = float(np.mean(list(cv_scores.values())))
+
         # =====================================================================
         # Step 5: Fit final ensemble on ALL data
         # =====================================================================
         self.log("Fitting final ensemble on full dataset...")
-        ensemble_model.fit(X, y)
+        try:
+            ensemble_model.fit(X, y)
+        except Exception as e:
+            # Ensemble fit failed — use best single model as the "ensemble"
+            self.log(f"Ensemble fit failed ({e}), falling back to best single model")
+            best_fb = max(cv_scores, key=cv_scores.get)
+            ensemble_model = trained_models[best_fb]
+            ensemble_score = cv_scores[best_fb]
         
         # Determine best single model
         best_model_name = max(cv_scores, key=cv_scores.get)

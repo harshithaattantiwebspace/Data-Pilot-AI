@@ -142,9 +142,14 @@ class ExplainerAgent(BaseAgent):
         elif trained_models:
             model_name = list(trained_models.keys())[0]
             explain_model = trained_models[model_name]
-        else:
+        elif ensemble_model is not None:
             explain_model = ensemble_model
             model_name = 'Ensemble'
+        else:
+            self.log("No trained model available — skipping explainability.")
+            state['explanation_report'] = {'error': 'No model available to explain'}
+            state['stage'] = 'explained'
+            return state
 
         self.log(f"Explaining model: {model_name}")
 

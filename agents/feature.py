@@ -55,12 +55,31 @@ class FeatureAgent(BaseAgent):
         }
         
         # =====================================================================
-        # Step 1: Remove ID columns (not useful for ML)
+        # Step 1: Remove non-modelable columns (ID, datetime, text)
+        # Bool columns are converted to int (0/1).
+        # Datetime columns cannot be fed to sklearn — drop them.
         # =====================================================================
-        id_cols = [c for c, t in column_types.items() if t == 'id' and c in X.columns]
-        X = X.drop(columns=id_cols)
-        feature_report['dropped_columns'] = id_cols
-        self.log(f"Removed ID columns: {id_cols}")
+        drop_types = {'id', 'datetime', 'text'}
+        drop_cols = [c for c, t in column_types.items() if t in drop_types and c in X.columns]
+        X = X.drop(columns=drop_cols)
+        feature_report['dropped_columns'] = drop_cols
+        self.log(f"Removed non-modelable columns ({', '.join(drop_types)}): {drop_cols}")
+
+        # Convert bool columns to int
+        bool_cols = [c for c in X.columns if X[c].dtype == bool or str(X[c].dtype) == 'bool']
+        for col in bool_cols:
+            X[col] = X[col].astype(int)
+        if bool_cols:
+            self.log(f"Converted bool columns to int: {bool_cols}")
+
+        # Drop any remaining non-numeric, non-object columns sklearn can't handle
+        # (e.g. datetime64 that wasn't caught by column_types)
+        bad_cols = [c for c in X.columns
+                    if not pd.api.types.is_numeric_dtype(X[c])
+                    and not pd.api.types.is_object_dtype(X[c])]
+        if bad_cols:
+            X = X.drop(columns=bad_cols)
+            self.log(f"Dropped unsupported dtype columns: {bad_cols}")
         
         # =====================================================================
         # Step 2: Encode categorical columns
@@ -103,6 +122,31 @@ class FeatureAgent(BaseAgent):
             self.encoders['target'] = le
             self.log(f"Encoded target: {list(le.classes_)}")
         
+        # =====================================================================
+        # Final: enforce all columns are numeric float64 for sklearn.
+        # Use explicit dtype checks — more reliable than try/except astype
+        # across pandas/numpy versions.
+        # =====================================================================
+        cols_to_drop = []
+        for col in list(X.columns):
+            if (pd.api.types.is_datetime64_any_dtype(X[col]) or
+                    pd.api.types.is_timedelta64_dtype(X[col])):
+                cols_to_drop.append(col)
+            elif pd.api.types.is_bool_dtype(X[col]):
+                X[col] = X[col].astype(np.float64)
+            elif pd.api.types.is_numeric_dtype(X[col]):
+                X[col] = X[col].astype(np.float64)
+            else:
+                cols_to_drop.append(col)
+        if cols_to_drop:
+            X = X.drop(columns=cols_to_drop)
+            self.log(f"Dropped non-numeric columns before modeling: {cols_to_drop}")
+
+        # Fill any remaining NaN/inf so sklearn doesn't error
+        X = X.fillna(0).replace([float('inf'), float('-inf')], 0)
+
+        self.log(f"Final X shape: {X.shape}, dtypes: {X.dtypes.value_counts().to_dict()}")
+
         # Update pipeline state
         state['X'] = X
         state['y'] = y
@@ -155,8 +199,8 @@ class FeatureAgent(BaseAgent):
                 self.log(f"  {col}: Label encoded (binary, {n_unique} values)")
             
             elif n_unique <= 10:
-                # Low cardinality → One-Hot encoding
-                dummies = pd.get_dummies(X[col], prefix=col, drop_first=True)
+                # Low cardinality → One-Hot encoding (dtype=int avoids bool columns)
+                dummies = pd.get_dummies(X[col], prefix=col, drop_first=True).astype(int)
                 X = pd.concat([X.drop(columns=[col]), dummies], axis=1)
                 encoding_info[col] = {
                     'method': 'onehot',
@@ -199,7 +243,7 @@ class FeatureAgent(BaseAgent):
         """
         scaling_info = {}
         
-        numeric_cols = [c for c in X.columns if X[c].dtype in ['int64', 'float64']]
+        numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
         
         if len(numeric_cols) == 0:
             return X, scaling_info
