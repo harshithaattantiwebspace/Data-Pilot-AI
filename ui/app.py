@@ -376,16 +376,15 @@ if active_view == 'insights':
 
     if analysis:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # STORYTELLING LAYOUT — applies visual hierarchy, Gestalt
-        # principles, horizontal logic, 3-second comprehension test
+        # STORYTELLING LAYOUT — visual hierarchy, Gestalt, 3-second test
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # ── HEADLINE: One-sentence summary (3-second test) ──
         domain = analysis.get('domain', 'General')
         n_insights = len(analysis.get('insights', []))
         n_charts = len(analysis.get('charts', {}))
         summary_text = analysis.get('summary', '')
 
+        # ── HEADLINE ──
         st.markdown(
             f'<div style="background:linear-gradient(135deg,#1E293B,#334155);'
             f'border-radius:12px;padding:28px 32px;margin:0 0 24px 0;color:white;">'
@@ -393,18 +392,48 @@ if active_view == 'insights':
             f'Analysis Complete — {n_insights} Insights Discovered</div>'
             f'<div style="font-size:1.05em;opacity:0.85;line-height:1.5;">{summary_text}</div>'
             f'<div style="display:flex;gap:32px;margin-top:16px;">'
-            f'<span style="font-size:0.9em;opacity:0.7;">📁 Domain: <b>{domain}</b></span>'
-            f'<span style="font-size:0.9em;opacity:0.7;">📊 Charts: <b>{n_charts}</b></span>'
+            f'<span style="font-size:0.9em;opacity:0.7;">Domain: <b>{domain}</b></span>'
+            f'<span style="font-size:0.9em;opacity:0.7;">Charts: <b>{n_charts}</b></span>'
             f'</div></div>',
             unsafe_allow_html=True
         )
 
-        # ── KEY TAKEAWAYS: the "executive summary" a manager reads first ──
+        # ── KPI CARDS ──
+        kpis = analysis.get('kpis', [])
+        if kpis:
+            kpi_cols = st.columns(min(len(kpis), 6))
+            for i, kpi in enumerate(kpis):
+                if i < len(kpi_cols):
+                    with kpi_cols[i]:
+                        fmt = kpi.get('format', ',.0f')
+                        try:
+                            formatted = f'{kpi["value"]:{fmt}}'
+                        except (ValueError, KeyError):
+                            formatted = str(kpi.get('value', ''))
+                        st.metric(
+                            label=kpi.get('name', ''),
+                            value=formatted,
+                            help=kpi.get('description', '')
+                        )
+
+        # ── DATA QUALITY WARNINGS ──
+        quality = analysis.get('data_quality', {})
+        if quality.get('warnings'):
+            for w in quality['warnings']:
+                st.markdown(
+                    f'<div style="background:#451A03;border:1px solid #92400E;'
+                    f'border-radius:8px;padding:12px 16px;margin:8px 0;'
+                    f'color:#FDE68A;font-size:0.9em;line-height:1.5;">'
+                    f'<b>Data Quality:</b> {w}</div>',
+                    unsafe_allow_html=True
+                )
+
+        # ── KEY TAKEAWAYS ──
         takeaways = analysis.get('key_takeaways', [])
         if takeaways:
             st.markdown(
                 '<div style="font-size:1.3em;font-weight:700;color:#1E293B;'
-                'margin:24px 0 12px 0;">Key Takeaways — What You Need to Know</div>',
+                'margin:24px 0 12px 0;">Key Takeaways</div>',
                 unsafe_allow_html=True
             )
             st.markdown(
@@ -420,7 +449,7 @@ if active_view == 'insights':
                 )
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── INSIGHT CARDS: each chart + its narrative = one story unit ──
+        # ── INSIGHT CARDS ──
         st.markdown(
             '<div style="font-size:1.3em;font-weight:700;color:#1E293B;'
             'margin:8px 0 16px 0;">Insights Dashboard</div>',
@@ -431,6 +460,12 @@ if active_view == 'insights':
         narratives = analysis.get('narratives', {})
         insights_list = analysis.get('insights', [])
 
+        badge_colors = {
+            'ranking': '#2563EB', 'comparison': '#7C3AED',
+            'composition': '#059669', 'distribution': '#D97706',
+            'correlation': '#DC2626', 'trend': '#0891B2',
+        }
+
         insight_chart_keys = [k for k in charts if k.startswith('insight_')]
         for idx, chart_name in enumerate(insight_chart_keys):
             fig = charts[chart_name]
@@ -440,16 +475,9 @@ if active_view == 'insights':
             insight_meta = insights_list[idx] if idx < len(insights_list) else {}
             narr = narratives.get(chart_name, '')
             itype = insight_meta.get('insight_type', 'general')
-
-            # Badge color by insight type (pre-attentive: color for category)
-            badge_colors = {
-                'ranking': '#2563EB', 'comparison': '#7C3AED',
-                'composition': '#059669', 'distribution': '#D97706',
-                'correlation': '#DC2626', 'trend': '#0891B2',
-            }
             badge_bg = badge_colors.get(itype, '#6B7280')
+            title = insight_meta.get('title', chart_name.replace('_', ' ').title())
 
-            # Card container — Gestalt proximity: chart + narrative grouped together
             st.markdown(
                 f'<div style="background:white;border-radius:10px;'
                 f'border:1px solid #F1F5F9;margin:0 0 20px 0;overflow:hidden;'
@@ -458,6 +486,7 @@ if active_view == 'insights':
                 f'<span style="background:{badge_bg};color:white;padding:3px 10px;'
                 f'border-radius:12px;font-size:0.75em;font-weight:600;'
                 f'text-transform:uppercase;letter-spacing:0.5px;">{itype}</span>'
+                f'<span style="font-size:1.05em;font-weight:600;color:#1F2937;">{title}</span>'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -474,12 +503,12 @@ if active_view == 'insights':
 
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── OVERVIEW CHARTS: supporting context in 2-col grid ──
+        # ── OVERVIEW CHARTS (2-col grid) ──
         overview_keys = [k for k in charts if k.startswith('overview_')]
         if overview_keys:
             st.markdown(
                 '<div style="font-size:1.15em;font-weight:600;color:#64748B;'
-                'margin:28px 0 12px 0;">Supporting Context — Data Overview</div>',
+                'margin:28px 0 12px 0;">Data Overview</div>',
                 unsafe_allow_html=True
             )
             for i in range(0, len(overview_keys), 2):
@@ -495,7 +524,7 @@ if active_view == 'insights':
         # Dashboard link
         dashboard = analysis.get('dashboard', {})
         if dashboard.get('path'):
-            st.info(f"📄 Full HTML dashboard saved to: `{dashboard['path']}`")
+            st.info(f"Full HTML dashboard saved to: `{dashboard['path']}`")
 
     if not prompt_result and not analysis:
         st.info("Click **Find Insights** to analyze your data.")

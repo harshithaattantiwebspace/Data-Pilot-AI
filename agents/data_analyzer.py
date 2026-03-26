@@ -55,6 +55,9 @@ SAMPLE DATA (first 5 rows):
 BASIC STATISTICS:
 {statistics}
 
+STATISTICAL HIGHLIGHTS (pre-computed):
+{stat_highlights}
+
 YOUR TASK:
 Analyze this data and suggest 6-8 KEY INSIGHTS that a business manager would want to see.
 For each insight, specify what chart to create.
@@ -63,11 +66,13 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text):
 {{
   "domain": "the business domain (e.g., sales, HR, healthcare, finance)",
   "summary": "one paragraph overview of what this dataset is about",
+  "key_metric": "the single most important numeric column for business decisions",
+  "key_grouping": "the most meaningful categorical column to segment by",
   "insights": [
     {{
-      "title": "Short insight title",
+      "title": "Short insight title that states the FINDING (e.g. 'Region X leads with 40% of revenue'), NOT just axis labels",
       "description": "What this insight reveals and why it matters",
-      "chart_type": "bar|line|pie|scatter|heatmap|histogram|box|treemap|funnel|area",
+      "chart_type": "bar|line|scatter|heatmap|histogram|box|treemap|funnel|area",
       "x_column": "column name for x-axis (or null)",
       "y_column": "column name for y-axis (or null)",
       "color_column": "column for color grouping (or null)",
@@ -84,6 +89,13 @@ RULES:
 - Include at least 1 distribution chart, 1 comparison chart, and 1 composition chart
 - Think about what a MANAGER would want to know, not what a data scientist would want
 - Focus on actionable business insights
+- SKIP insights where data is nearly uniform (all categories within 5% of each other)
+- SKIP correlations weaker than r=0.15 — they are meaningless noise
+- NEVER use pie charts — use horizontal bar charts instead
+- Prefer columns with HIGH variance and BUSINESS meaning as the y-axis metric
+- DO NOT pick ID columns, index columns, or near-constant columns as metrics
+- key_metric should be the column most useful for business KPIs (revenue, count, score, etc.)
+- key_grouping should be a categorical column with 3-15 distinct values
 """
 
 USER_PROMPT_TEMPLATE = """You are a senior data analyst. The user wants a specific visualization.
@@ -258,6 +270,19 @@ class DataAnalyzerAgent(BaseAgent):
         charts = {}
         narratives = {}
 
+        # Filter insights through significance gate
+        significant_insights = []
+        for insight in insight_list:
+            is_sig, reason = self._is_insight_significant(df, insight)
+            if is_sig:
+                significant_insights.append(insight)
+            else:
+                self.log(f"  Filtered out: '{insight.get('title', '?')}' — {reason}")
+
+        if len(significant_insights) < len(insight_list):
+            self.log(f"  Kept {len(significant_insights)}/{len(insight_list)} insights after quality filtering")
+        insight_list = significant_insights
+
         for i, insight in enumerate(insight_list):
             chart_name = f"insight_{i+1}"
             self.log(f"  Creating chart {i+1}: {insight.get('title', 'Untitled')}")
@@ -279,14 +304,22 @@ class DataAnalyzerAgent(BaseAgent):
         overview_charts = self._create_overview_charts(df, data_profile, analyzer_dir)
         charts.update(overview_charts)
 
-        # Step 5: Generate key takeaways
-        self.log("Step 5: Generating key takeaways...")
+        # Step 5: Generate KPIs and key takeaways
+        self.log("Step 5: Generating KPIs and key takeaways...")
+        kpis = self._generate_kpis(df, data_profile, domain)
         key_takeaways = self._generate_key_takeaways(df, data_profile, insight_list)
+
+        # Assess data quality and add warnings to takeaways
+        quality = self._assess_data_quality(df, data_profile)
+        if quality.get('warnings'):
+            for w in quality['warnings']:
+                key_takeaways.append(f'**Data Quality Warning:** {w}')
 
         # Step 6: Build the combined dashboard
         self.log("Step 6: Building dashboard...")
         dashboard = self._build_dashboard(
-            df, domain, summary, insight_list, charts, narratives, analyzer_dir
+            df, domain, summary, insight_list, charts, narratives, analyzer_dir,
+            kpis=kpis, key_takeaways=key_takeaways, data_quality=quality
         )
 
         # Update state
@@ -297,6 +330,8 @@ class DataAnalyzerAgent(BaseAgent):
             'charts': charts,
             'narratives': narratives,
             'key_takeaways': key_takeaways,
+            'kpis': kpis,
+            'data_quality': quality,
             'dashboard': dashboard,
             'profile': data_profile
         }
@@ -496,6 +531,417 @@ class DataAnalyzerAgent(BaseAgent):
         return profile
 
     # =====================================================================
+    # STATISTICAL HIGHLIGHTS (grounding data for LLM + insight filtering)
+    # =====================================================================
+
+    def _compute_stat_highlights(self, df: pd.DataFrame, profile: Dict) -> str:
+        """
+        Pre-compute statistical facts so the LLM has GROUNDED data to work with.
+        This prevents the LLM from guessing and ensures accuracy.
+        """
+        lines = []
+        numeric_cols = profile.get('numeric_cols', [])
+        cat_cols = profile.get('categorical_cols', [])
+
+        # Column importance ranking
+        col_scores = self._score_columns(df, profile)
+        if col_scores:
+            top_cols = sorted(col_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+            lines.append("MOST IMPORTANT COLUMNS (by variance + business relevance):")
+            for col, score in top_cols:
+                lines.append(f"  - {col}: importance={score:.2f}")
+
+        # Strongest correlations (only meaningful ones)
+        if len(numeric_cols) >= 2:
+            corr = df[numeric_cols].corr()
+            upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+            if not upper.stack().empty:
+                strong_corrs = upper.stack().abs()
+                strong_corrs = strong_corrs[strong_corrs > 0.15].sort_values(ascending=False).head(5)
+                if len(strong_corrs) > 0:
+                    lines.append("\nMEANINGFUL CORRELATIONS (|r| > 0.15):")
+                    for (c1, c2), val in strong_corrs.items():
+                        actual = corr.loc[c1, c2]
+                        lines.append(f"  - {c1} vs {c2}: r={actual:.3f}")
+                else:
+                    lines.append("\nNO MEANINGFUL CORRELATIONS found (all |r| < 0.15)")
+
+        # Categorical uniformity check
+        for col in cat_cols[:5]:
+            vc = df[col].value_counts(normalize=True)
+            if len(vc) > 1:
+                max_pct = vc.iloc[0] * 100
+                min_pct = vc.iloc[-1] * 100
+                spread = max_pct - min_pct
+                if spread < 5:
+                    lines.append(f"\nWARNING: '{col}' is nearly UNIFORM — all categories within {spread:.1f}% of each other. Skip insights about this column's distribution.")
+                elif max_pct > 40:
+                    lines.append(f"\n'{col}': '{vc.index[0]}' dominates at {max_pct:.0f}%")
+
+        # Data quality flags
+        quality = self._assess_data_quality(df, profile)
+        if quality.get('warnings'):
+            lines.append("\nDATA QUALITY WARNINGS:")
+            for w in quality['warnings']:
+                lines.append(f"  - {w}")
+
+        return '\n'.join(lines) if lines else 'No special highlights.'
+
+    def _score_columns(self, df: pd.DataFrame, profile: Dict) -> Dict[str, float]:
+        """
+        Score each column by how useful it is for analysis.
+        Higher score = more interesting / business-relevant.
+
+        Factors: variance, range, business keyword match, not-ID-like, cardinality.
+        """
+        scores = {}
+        numeric_cols = profile.get('numeric_cols', [])
+        cat_cols = profile.get('categorical_cols', [])
+
+        # Business-relevant keywords (boost score)
+        high_value_keywords = [
+            'revenue', 'sales', 'price', 'amount', 'total', 'cost', 'profit',
+            'income', 'salary', 'quantity', 'order', 'payment', 'transaction',
+            'rating', 'score', 'count', 'likes', 'views', 'clicks',
+            'matches', 'followers', 'subscribers', 'downloads', 'visits',
+            'duration', 'time_spent', 'age', 'weight', 'height', 'distance',
+        ]
+        medium_keywords = [
+            'category', 'type', 'region', 'department', 'status', 'gender',
+            'segment', 'channel', 'product', 'brand', 'class', 'group',
+            'city', 'state', 'country', 'store', 'source', 'platform',
+            'level', 'tier', 'plan', 'role', 'industry',
+        ]
+        id_keywords = ['_id', 'id_', 'uuid', 'guid', 'index', 'key', 'pk']
+
+        for col in numeric_cols:
+            name_lower = col.lower()
+
+            # Skip ID-like columns
+            if any(kw in name_lower for kw in id_keywords):
+                scores[col] = 0.0
+                continue
+            if name_lower in ('id', 'pk', 'rownum', 'row_num', 'record'):
+                scores[col] = 0.0
+                continue
+            # Skip near-unique columns (likely IDs)
+            if df[col].nunique() > 0.9 * len(df) and len(df) > 50:
+                scores[col] = 0.0
+                continue
+
+            score = 0.0
+            std = df[col].std()
+            mean = abs(df[col].mean()) + 1e-9
+            cv = std / mean  # coefficient of variation
+
+            # Variance score (0-3): higher CV = more interesting
+            if cv > 1.0:
+                score += 3.0
+            elif cv > 0.5:
+                score += 2.0
+            elif cv > 0.1:
+                score += 1.0
+            else:
+                score += 0.2  # near-constant — boring
+
+            # Range score: wider range = more interesting
+            val_range = df[col].max() - df[col].min()
+            if val_range > 100:
+                score += 1.5
+            elif val_range > 10:
+                score += 1.0
+            elif val_range > 1:
+                score += 0.5
+            else:
+                score += 0.1  # tiny range like 0-6
+
+            # Business keyword boost
+            if any(kw in name_lower for kw in high_value_keywords):
+                score += 3.0
+            elif any(kw in name_lower for kw in medium_keywords):
+                score += 1.5
+
+            # Penalize very low cardinality numerics (e.g., 0-6 integers)
+            if df[col].nunique() <= 7:
+                score *= 0.5
+
+            scores[col] = round(score, 2)
+
+        for col in cat_cols:
+            name_lower = col.lower()
+            if any(kw in name_lower for kw in id_keywords):
+                scores[col] = 0.0
+                continue
+            if df[col].nunique() > 0.9 * len(df):
+                scores[col] = 0.0
+                continue
+
+            score = 0.0
+            n_unique = df[col].nunique()
+
+            # Best grouping columns have 3-15 categories
+            if 3 <= n_unique <= 15:
+                score += 2.5
+            elif 2 <= n_unique <= 30:
+                score += 1.5
+            elif n_unique <= 50:
+                score += 0.5
+            else:
+                score += 0.1
+
+            # Business keyword boost
+            if any(kw in name_lower for kw in medium_keywords):
+                score += 2.0
+
+            # Penalize uniform distributions
+            vc = df[col].value_counts(normalize=True)
+            if len(vc) > 1:
+                spread = (vc.iloc[0] - vc.iloc[-1]) * 100
+                if spread < 5:
+                    score *= 0.3  # uniform — not interesting
+
+            scores[col] = round(score, 2)
+
+        return scores
+
+    def _assess_data_quality(self, df: pd.DataFrame, profile: Dict) -> Dict:
+        """
+        Assess data quality and detect synthetic/uniform datasets.
+        Returns quality score and warnings.
+        """
+        warnings = []
+        quality_score = 100
+        n_rows = len(df)
+        numeric_cols = profile.get('numeric_cols', [])
+        cat_cols = profile.get('categorical_cols', [])
+
+        # Check for uniform categorical distributions (synthetic data signal)
+        uniform_cats = 0
+        for col in cat_cols:
+            vc = df[col].value_counts(normalize=True)
+            if len(vc) > 1:
+                spread = (vc.iloc[0] - vc.iloc[-1]) * 100
+                if spread < 3:
+                    uniform_cats += 1
+
+        if uniform_cats > 0 and len(cat_cols) > 0:
+            pct_uniform = uniform_cats / len(cat_cols) * 100
+            if pct_uniform > 50:
+                warnings.append(
+                    f"{uniform_cats}/{len(cat_cols)} categorical columns have nearly "
+                    f"uniform distributions. This data may be synthetic or randomly generated. "
+                    f"Ranking/composition insights will not be meaningful."
+                )
+                quality_score -= 20
+
+        # Check for low correlation across all numeric pairs
+        if len(numeric_cols) >= 2:
+            corr = df[numeric_cols].corr()
+            upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+            if not upper.stack().empty:
+                max_corr = upper.stack().abs().max()
+                if max_corr < 0.15:
+                    warnings.append(
+                        f"No meaningful correlations found between numeric columns "
+                        f"(max |r| = {max_corr:.3f}). Scatter plots will show noise, not patterns."
+                    )
+
+        # Missing data
+        missing_pct = df.isnull().sum().sum() / (n_rows * len(df.columns)) * 100
+        if missing_pct > 20:
+            warnings.append(f"{missing_pct:.0f}% of data is missing — insights may be unreliable.")
+            quality_score -= 15
+
+        # Very small dataset
+        if n_rows < 50:
+            warnings.append("Very small dataset (<50 rows). Statistical patterns may not be reliable.")
+            quality_score -= 10
+
+        return {
+            'quality_score': max(0, quality_score),
+            'warnings': warnings,
+            'is_likely_synthetic': uniform_cats > len(cat_cols) * 0.5 if cat_cols else False,
+        }
+
+    def _generate_kpis(self, df: pd.DataFrame, profile: Dict,
+                       domain: str = 'General') -> List[Dict]:
+        """
+        Auto-detect KPIs from the dataset based on domain + column semantics.
+        Returns a list of KPI dicts with {name, value, format, trend, description}.
+        """
+        kpis = []
+        col_scores = self._score_columns(df, profile)
+        numeric_cols = [c for c in profile.get('numeric_cols', []) if col_scores.get(c, 0) > 0]
+        cat_cols = [c for c in profile.get('categorical_cols', []) if col_scores.get(c, 0) > 0]
+
+        # Sort by importance
+        numeric_sorted = sorted(numeric_cols, key=lambda c: col_scores.get(c, 0), reverse=True)
+
+        # KPI patterns: detect from column names
+        kpi_patterns = {
+            'total': {
+                'keywords': ['revenue', 'sales', 'amount', 'total', 'income', 'profit',
+                             'cost', 'payment', 'transaction', 'order'],
+                'agg': 'sum', 'format': ',.0f', 'prefix': 'Total'
+            },
+            'average': {
+                'keywords': ['rating', 'score', 'price', 'age', 'duration', 'time_spent',
+                             'salary', 'likes', 'views', 'matches', 'followers'],
+                'agg': 'mean', 'format': ',.1f', 'prefix': 'Average'
+            },
+            'count': {
+                'keywords': ['count', 'quantity', 'visits', 'clicks', 'downloads',
+                             'subscribers'],
+                'agg': 'sum', 'format': ',.0f', 'prefix': 'Total'
+            },
+        }
+
+        used_cols = set()
+        for pattern_name, pattern in kpi_patterns.items():
+            for col in numeric_sorted:
+                if col in used_cols:
+                    continue
+                name_lower = col.lower()
+                if any(kw in name_lower for kw in pattern['keywords']):
+                    if pattern['agg'] == 'sum':
+                        value = df[col].sum()
+                    elif pattern['agg'] == 'mean':
+                        value = df[col].mean()
+                    else:
+                        value = df[col].sum()
+
+                    kpis.append({
+                        'name': f"{pattern['prefix']} {col.replace('_', ' ').title()}",
+                        'value': value,
+                        'format': pattern['format'],
+                        'column': col,
+                        'description': f"{pattern['prefix']} across {len(df):,} records"
+                    })
+                    used_cols.add(col)
+                    if len(kpis) >= 6:
+                        break
+            if len(kpis) >= 6:
+                break
+
+        # If we didn't find enough named KPIs, add top-scored numeric columns
+        for col in numeric_sorted:
+            if len(kpis) >= 4:
+                break
+            if col in used_cols:
+                continue
+            # For remaining columns, use the most informative aggregation
+            mean_val = df[col].mean()
+            total_val = df[col].sum()
+            # If mean is small and total is large, show total; otherwise show average
+            if total_val > mean_val * 100:
+                kpis.append({
+                    'name': f"Total {col.replace('_', ' ').title()}",
+                    'value': total_val,
+                    'format': ',.0f',
+                    'column': col,
+                    'description': f"Sum across all records"
+                })
+            else:
+                kpis.append({
+                    'name': f"Avg {col.replace('_', ' ').title()}",
+                    'value': mean_val,
+                    'format': ',.1f',
+                    'column': col,
+                    'description': f"Average value"
+                })
+            used_cols.add(col)
+
+        # Add a record count KPI
+        kpis.insert(0, {
+            'name': 'Total Records',
+            'value': len(df),
+            'format': ',',
+            'column': None,
+            'description': f'{len(df.columns)} columns analyzed'
+        })
+
+        # Add data quality KPI
+        missing_pct = df.isnull().sum().sum() / (len(df) * len(df.columns)) * 100
+        completeness = 100 - missing_pct
+        kpis.append({
+            'name': 'Data Completeness',
+            'value': completeness,
+            'format': '.1f',
+            'column': None,
+            'description': f'{missing_pct:.1f}% missing values'
+        })
+
+        return kpis[:6]  # Max 6 KPIs
+
+    def _is_insight_significant(self, df: pd.DataFrame, insight: Dict) -> Tuple[bool, str]:
+        """
+        Check if an insight is actually meaningful or just noise.
+        Returns (is_significant, reason_if_not).
+
+        This is the KEY QUALITY GATE — prevents showing garbage insights.
+        """
+        itype = insight.get('insight_type', '')
+        x_col = insight.get('x_column')
+        y_col = insight.get('y_column')
+        chart_type = insight.get('chart_type', 'bar')
+        agg = insight.get('aggregation', 'none')
+
+        # ── Correlation: skip if |r| < 0.15 ──
+        if itype == 'correlation' and chart_type == 'scatter':
+            if x_col and y_col and x_col in df.columns and y_col in df.columns:
+                try:
+                    if pd.api.types.is_numeric_dtype(df[x_col]) and pd.api.types.is_numeric_dtype(df[y_col]):
+                        r = df[x_col].corr(df[y_col])
+                        if abs(r) < 0.15:
+                            return False, f"Correlation too weak (r={r:.3f}), skipping"
+                except Exception:
+                    pass
+
+        # ── Ranking/Composition: skip if distribution is uniform ──
+        if itype in ('ranking', 'composition', 'comparison') and x_col and y_col:
+            if x_col in df.columns and y_col in df.columns:
+                try:
+                    agg_func = {'sum': 'sum', 'mean': 'mean', 'count': 'count',
+                                'median': 'median'}.get(agg, 'sum')
+                    grouped = df.groupby(x_col)[y_col].agg(agg_func)
+                    if len(grouped) > 1:
+                        max_val = grouped.max()
+                        min_val = grouped.min()
+                        mean_val = grouped.mean()
+                        # Check if spread is less than 5% of mean
+                        if mean_val > 0 and (max_val - min_val) / mean_val < 0.05:
+                            return False, f"Values are nearly uniform (spread < 5% of mean), skipping"
+                        # Check if top category is less than 3% ahead
+                        total = grouped.sum()
+                        if total > 0:
+                            top_pct = grouped.max() / total * 100
+                            bottom_pct = grouped.min() / total * 100
+                            if top_pct - bottom_pct < 3:
+                                return False, f"Categories differ by less than 3%, skipping"
+                except Exception:
+                    pass
+
+        # ── Distribution: skip if near-zero variance ──
+        if itype == 'distribution':
+            col = x_col or y_col
+            if col and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                std = df[col].std()
+                mean = abs(df[col].mean()) + 1e-9
+                if std / mean < 0.01:
+                    return False, f"Near-zero variance (CV={std/mean:.4f}), skipping"
+                # Skip if only 2-3 unique values — not enough for a histogram
+                if df[col].nunique() <= 2:
+                    return False, f"Only {df[col].nunique()} unique values, too few for distribution"
+
+        # ── Skip if columns don't exist ──
+        for col_key in ['x_column', 'y_column']:
+            col = insight.get(col_key)
+            if col and col not in df.columns:
+                return False, f"Column '{col}' does not exist"
+
+        return True, "OK"
+
+    # =====================================================================
     # STEP 2: LLM INSIGHT DISCOVERY
     # =====================================================================
 
@@ -522,13 +968,17 @@ class DataAnalyzerAgent(BaseAgent):
         # Statistics
         stats_str = df.describe(include='all').to_string()
 
+        # Pre-compute statistical highlights so LLM doesn't guess
+        stat_highlights = self._compute_stat_highlights(df, profile)
+
         prompt = INSIGHT_DISCOVERY_PROMPT.format(
             dataset_name=dataset_name,
             n_rows=profile['n_rows'],
             n_cols=profile['n_cols'],
             column_info=column_info,
             sample_data=sample_data,
-            statistics=stats_str
+            statistics=stats_str,
+            stat_highlights=stat_highlights
         )
 
         try:
@@ -661,6 +1111,7 @@ class DataAnalyzerAgent(BaseAgent):
             # Swap to horizontal bar: category on y, value on x
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
                 plot_data = df.groupby(x_col)[y_col].sum().sort_values()
+                bar_width = 0.5 if len(plot_data) <= 5 else 0.7
                 fig = go.Figure(go.Bar(
                     x=plot_data.values,
                     y=plot_data.index.astype(str),
@@ -669,6 +1120,7 @@ class DataAnalyzerAgent(BaseAgent):
                     text=[f'{v:,.0f}' for v in plot_data.values],
                     textposition='outside',
                     textfont=dict(size=11, color='#374151'),
+                    width=bar_width,
                 ))
                 # Annotate the leader
                 if len(plot_data) > 0:
@@ -686,26 +1138,40 @@ class DataAnalyzerAgent(BaseAgent):
                 fig = go.Figure()
 
         elif chart_type == 'bar':
-            fig = px.bar(
-                df, x=x_col, y=y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-            )
-            # Annotate only the top bar (pre-attentive: highlight what matters)
-            if y_col and y_col in df.columns and x_col and x_col in df.columns:
-                try:
-                    if color_col is None:
-                        top_idx = df[y_col].idxmax()
-                        top_x = df.loc[top_idx, x_col]
-                        top_y = df.loc[top_idx, y_col]
-                        fig.add_annotation(
-                            x=top_x, y=top_y,
-                            text=f"▲ {top_y:,.0f}",
-                            showarrow=True, arrowhead=0, arrowcolor='#94A3B8',
-                            font=dict(size=11, color=color_seq[4], weight='bold'),
-                            yshift=10,
-                        )
-                except Exception:
-                    pass
+            if x_col and y_col and x_col in df.columns and y_col in df.columns:
+                n_cats = df[x_col].nunique()
+                # Use go.Bar directly for precise control
+                if color_col and color_col in df.columns:
+                    # Grouped bars with color dimension
+                    fig = px.bar(
+                        df, x=x_col, y=y_col, color=color_col,
+                        title=title, color_discrete_sequence=color_seq,
+                        barmode='group',
+                    )
+                else:
+                    # Simple bars — build explicitly for reliability
+                    bar_colors = [color_seq[i % len(color_seq)] for i in range(len(df))]
+                    fmt = '.1f' if df[y_col].max() < 100 else ',.0f'
+                    fig = go.Figure(go.Bar(
+                        x=df[x_col].astype(str),
+                        y=df[y_col],
+                        marker_color=bar_colors,
+                        text=[f'{v:{fmt}}' for v in df[y_col]],
+                        textposition='outside',
+                        textfont=dict(size=11, color='#374151'),
+                    ))
+                # Set bargap so bars have good width
+                bargap = 0.45 if n_cats <= 4 else 0.35 if n_cats <= 8 else 0.25
+                ymax = df[y_col].max()
+                ypad = ymax * 0.18  # room for text-outside labels
+                fig.update_layout(
+                    bargap=bargap,
+                    yaxis=dict(range=[0, ymax + ypad], showgrid=True,
+                               gridcolor='#F3F4F6', gridwidth=0.5),
+                    xaxis=dict(showgrid=False),
+                )
+            else:
+                fig = go.Figure()
 
         elif chart_type == 'line':
             fig = px.line(
@@ -733,11 +1199,62 @@ class DataAnalyzerAgent(BaseAgent):
                     pass
 
         elif chart_type == 'scatter':
+            # Add jitter for integer columns to avoid overplotting
+            scatter_df = df.copy()
+            if x_col and x_col in scatter_df.columns and pd.api.types.is_integer_dtype(scatter_df[x_col]):
+                if scatter_df[x_col].nunique() <= 20:
+                    jitter_col = x_col + '_jittered'
+                    scatter_df[jitter_col] = scatter_df[x_col].astype(float) + np.random.uniform(-0.2, 0.2, len(scatter_df))
+                    x_col_plot = jitter_col
+                else:
+                    x_col_plot = x_col
+            else:
+                x_col_plot = x_col
+            if y_col and y_col in scatter_df.columns and pd.api.types.is_integer_dtype(scatter_df[y_col]):
+                if scatter_df[y_col].nunique() <= 20:
+                    jitter_col = y_col + '_jittered'
+                    scatter_df[jitter_col] = scatter_df[y_col].astype(float) + np.random.uniform(-0.2, 0.2, len(scatter_df))
+                    y_col_plot = jitter_col
+                else:
+                    y_col_plot = y_col
+            else:
+                y_col_plot = y_col
+
+            # Sample large datasets for readable scatter plots
+            if len(scatter_df) > 5000:
+                scatter_df = scatter_df.sample(5000, random_state=42)
+
+            # Scale marker size based on dataset size
+            n_pts = len(scatter_df)
+            marker_sz = 10 if n_pts < 200 else 7 if n_pts < 1000 else 5
+
             fig = px.scatter(
-                df, x=x_col, y=y_col, color=color_col,
+                scatter_df, x=x_col_plot, y=y_col_plot, color=color_col,
                 title=title, color_discrete_sequence=color_seq,
-                opacity=0.65, trendline='ols' if x_col and y_col else None
+                opacity=0.75, trendline='ols' if x_col_plot and y_col_plot else None
             )
+            # Make markers visible
+            fig.update_traces(marker=dict(size=marker_sz, line=dict(width=0.5, color='#374151')),
+                              selector=dict(mode='markers'))
+
+            # Restore original axis labels (hide jitter column names)
+            if x_col_plot and x_col_plot != x_col:
+                fig.update_xaxes(title_text=x_col)
+            if y_col_plot and y_col_plot != y_col:
+                fig.update_yaxes(title_text=y_col)
+
+            # Pad axis ranges so points aren't clipped at edges
+            for col_plot, orig_col, axis in [(x_col_plot, x_col, 'x'), (y_col_plot, y_col, 'y')]:
+                if col_plot and col_plot in scatter_df.columns and pd.api.types.is_numeric_dtype(scatter_df[col_plot]):
+                    vals = scatter_df[col_plot].dropna()
+                    if len(vals) > 0:
+                        vmin, vmax = vals.min(), vals.max()
+                        pad = max((vmax - vmin) * 0.08, 0.1)
+                        if axis == 'x':
+                            fig.update_xaxes(range=[vmin - pad, vmax + pad])
+                        else:
+                            fig.update_yaxes(range=[vmin - pad, vmax + pad])
+
             # Annotate correlation strength
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
                 try:
@@ -755,14 +1272,63 @@ class DataAnalyzerAgent(BaseAgent):
                     pass
 
         elif chart_type == 'histogram':
-            fig = px.histogram(
-                df, x=x_col or y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-                nbins=30, opacity=0.85
-            )
-            # Annotate mean line
             col = x_col or y_col
-            if col and col in df.columns and df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+            # Smart bin count based on data characteristics
+            nbins = 30
+            if col and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                n_unique = df[col].nunique()
+                val_range = df[col].max() - df[col].min()
+
+                if pd.api.types.is_integer_dtype(df[col]):
+                    # Integer columns: use exact bins for small ranges
+                    if n_unique <= 20 or val_range <= 20:
+                        nbins = max(int(val_range) + 1, n_unique)
+                        # Use bar chart for very small integer ranges (like 0-6)
+                        if n_unique <= 10:
+                            vc = df[col].value_counts().sort_index()
+                            fig = go.Figure(go.Bar(
+                                x=[str(v) for v in vc.index],
+                                y=vc.values,
+                                marker_color=color_seq[0],
+                                text=[f'{v:,}' for v in vc.values],
+                                textposition='outside',
+                                textfont=dict(size=11, color='#374151'),
+                                width=0.6,
+                            ))
+                            fig.update_layout(
+                                title=dict(text=title, font=dict(size=16, color='#1F2937')),
+                                xaxis_title=col,
+                                yaxis_title='Count',
+                                bargap=0.15,
+                            )
+                            # Add mean annotation
+                            mean_val = df[col].mean()
+                            fig.add_vline(
+                                x=str(round(mean_val)), line_dash='dot',
+                                line_color='#DC2626', line_width=1.5,
+                                annotation_text=f"Mean: {mean_val:.1f}",
+                                annotation_font=dict(size=11, color='#DC2626'),
+                                annotation_position='top right',
+                            )
+                            return self._apply_clean_layout(fig, title)
+                else:
+                    # Float columns: scale bins to data range
+                    if val_range <= 5:
+                        nbins = min(15, max(8, n_unique // 2))
+                    elif val_range <= 20:
+                        nbins = 20
+                    else:
+                        nbins = min(30, max(15, int(np.sqrt(len(df)))))
+
+            fig = px.histogram(
+                df, x=col, color=color_col,
+                title=title, color_discrete_sequence=color_seq,
+                nbins=nbins, opacity=0.85
+            )
+            # Ensure bars are visible — set bargap
+            fig.update_layout(bargap=0.05)
+            # Annotate mean line
+            if col and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                 mean_val = df[col].mean()
                 fig.add_vline(
                     x=mean_val, line_dash='dot', line_color='#DC2626', line_width=1.5,
@@ -854,17 +1420,54 @@ class DataAnalyzerAgent(BaseAgent):
             showline=False,
             title_font=dict(size=12, color='#9CA3AF'),
             tickfont=dict(size=11, color='#6B7280'),
-            zeroline=False,
         )
         # Y-axis: light gridlines only (they aid reading values)
+        # NOTE: do not set autorange here — chart-specific ranges set above are respected
         fig.update_yaxes(
             showgrid=True, gridcolor='#F3F4F6', gridwidth=0.5,
             showline=False,
             title_font=dict(size=12, color='#9CA3AF'),
             tickfont=dict(size=11, color='#6B7280'),
-            zeroline=False,
         )
 
+        return fig
+
+    def _apply_clean_layout(self, fig: go.Figure, title: str) -> go.Figure:
+        """Apply the standard decluttered layout to any figure."""
+        fig.update_layout(
+            template='plotly_white',
+            height=460,
+            title=dict(
+                text=title,
+                font=dict(size=16, color='#1F2937', family='Segoe UI, sans-serif'),
+                x=0.01, xanchor='left', y=0.97,
+            ),
+            font=dict(family='Segoe UI, sans-serif', size=12, color='#6B7280'),
+            margin=dict(t=55, b=40, l=50, r=25),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            legend=dict(
+                orientation='h', yanchor='bottom', y=1.02,
+                xanchor='left', x=0, font=dict(size=11),
+                bgcolor='rgba(0,0,0,0)',
+                borderwidth=0,
+            ),
+            hoverlabel=dict(
+                bgcolor='white', font_size=12, bordercolor='#E5E7EB',
+                font_family='Segoe UI, sans-serif'
+            ),
+        )
+        fig.update_xaxes(
+            showgrid=False, showline=False,
+            title_font=dict(size=12, color='#9CA3AF'),
+            tickfont=dict(size=11, color='#6B7280'),
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor='#F3F4F6', gridwidth=0.5,
+            showline=False,
+            title_font=dict(size=12, color='#9CA3AF'),
+            tickfont=dict(size=11, color='#6B7280'),
+        )
         return fig
 
     # =====================================================================
@@ -1342,9 +1945,13 @@ class DataAnalyzerAgent(BaseAgent):
                 f'exclude this column before relying on analysis that includes it.'
             )
 
-        # 3. Key numeric insight — most volatile metric deserves attention
-        if numeric_cols:
-            best_col = max(numeric_cols, key=lambda c: df[c].std() / (abs(df[c].mean()) + 1e-9))
+        # 3. Key numeric insight — most IMPORTANT metric (not just most volatile)
+        col_scores = self._score_columns(df, profile)
+        scored_numerics = [c for c in numeric_cols if col_scores.get(c, 0) > 1.0]
+        if not scored_numerics:
+            scored_numerics = numeric_cols
+        if scored_numerics:
+            best_col = max(scored_numerics, key=lambda c: col_scores.get(c, 0))
             mean_val = df[best_col].mean()
             std_val = df[best_col].std()
             cv = std_val / (abs(mean_val) + 1e-9) * 100
@@ -1355,32 +1962,44 @@ class DataAnalyzerAgent(BaseAgent):
                 f'it may reveal distinct customer segments or operational inconsistencies.'
             )
 
-        # 4. Dominant category — concentration risk or opportunity
+        # 4. Dominant category — concentration risk or opportunity (skip if uniform)
         if cat_cols:
             for cat in cat_cols:
                 vc = df[cat].value_counts()
-                top_pct = vc.iloc[0] / len(df) * 100 if len(vc) > 0 else 0
+                if len(vc) < 2:
+                    continue
+                top_pct = vc.iloc[0] / len(df) * 100
+                bottom_pct = vc.iloc[-1] / len(df) * 100
+                # Skip if distribution is nearly uniform (< 5% spread)
+                if top_pct - bottom_pct < 5:
+                    continue
                 if top_pct > 30:
                     takeaways.append(
-                        f'🏷️ **"{vc.index[0]}" dominates {cat}** with {top_pct:.0f}% of all records. '
+                        f'**"{vc.index[0]}" dominates {cat}** with {top_pct:.0f}% of all records. '
                         f'{"This concentration creates risk — if this segment underperforms, the overall numbers suffer. Consider diversification." if top_pct > 50 else "Monitor this segment closely; it drives the majority of your metrics."}'
                     )
                     break
 
-        # 5. Strongest correlation — predictive power / redundancy signal
+        # 5. Strongest correlation — only if meaningful (|r| > 0.2)
         if len(numeric_cols) >= 2:
             corr_matrix = df[numeric_cols].corr()
             upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
             if not upper.stack().empty:
                 max_idx = upper.stack().abs().idxmax()
                 max_val = corr_matrix.loc[max_idx[0], max_idx[1]]
-                if abs(max_val) > 0.4:
+                if abs(max_val) > 0.2:
                     direction = 'increase together' if max_val > 0 else 'move in opposite directions'
+                    strength = 'strongly' if abs(max_val) > 0.5 else 'moderately'
                     takeaways.append(
-                        f'🔗 **{max_idx[0]} and {max_idx[1]} are strongly linked** '
+                        f'**{max_idx[0]} and {max_idx[1]} are {strength} linked** '
                         f'(r={max_val:.2f} — they {direction}). '
                         f'**Use this:** if you can influence one, the other will likely follow. '
                         f'For predictive models, you may only need one of these features.'
+                    )
+                else:
+                    takeaways.append(
+                        f'**No strong correlations found** between numeric features '
+                        f'(max |r| = {abs(max_val):.2f}). Each feature captures independent information.'
                     )
 
         # 6. Outlier warning — actionable data quality flag
@@ -1415,65 +2034,51 @@ class DataAnalyzerAgent(BaseAgent):
         - CONTEXT FIRST: titles tell the finding; descriptions explain why it matters
         - CHART SELECTION: match chart type to data relationship (ranking→bar, trend→line)
         - COGNITIVE LOAD: max 8 insights, clear hierarchy, no junk charts
+        - QUALITY GATE: skip uniform/boring insights automatically
         """
         insights = []
         all_numeric = profile['numeric_cols']
         all_cat = profile['categorical_cols']
         datetime_cols = profile.get('datetime_cols', [])
 
-        # ── Smart column filtering: skip IDs, constants, and noise ──
-        def _is_id_like(col):
-            """Detect ID-like columns that shouldn't be charted."""
-            name = col.lower()
-            if any(tag in name for tag in ['_id', 'id_', 'index', 'uuid', 'guid', 'key']):
-                return True
-            if name in ('id', 'pk', 'rownum', 'row_num', 'record'):
-                return True
-            if df[col].nunique() > 0.9 * len(df) and len(df) > 50:
-                return True
-            return False
+        # ── Use column scoring system for smart selection ──
+        col_scores = self._score_columns(df, profile)
+        data_quality = self._assess_data_quality(df, profile)
 
-        numeric_cols = [c for c in all_numeric if not _is_id_like(c) and df[c].std() > 0]
+        # Filter columns using scores (skip anything scored 0)
+        numeric_cols = [c for c in all_numeric if col_scores.get(c, 0) > 0 and df[c].std() > 0]
         cat_cols = [c for c in all_cat
-                    if not _is_id_like(c)
+                    if col_scores.get(c, 0) > 0
                     and 1 < df[c].nunique() <= 50
                     and c not in datetime_cols]
 
         best_cat = [c for c in cat_cols if df[c].nunique() <= 15] or cat_cols
+
+        # Sort numeric columns by importance score (NOT just CV)
         numeric_sorted = sorted(numeric_cols,
-                                key=lambda c: df[c].std() / (abs(df[c].mean()) + 1e-9),
+                                key=lambda c: col_scores.get(c, 0),
                                 reverse=True)
 
-        # ── Detect the most likely "amount/value" column ──
-        value_col = None
-        for c in numeric_sorted:
-            name = c.lower()
-            if any(kw in name for kw in ['price', 'amount', 'revenue', 'sales',
-                                          'total', 'cost', 'profit', 'salary',
-                                          'income', 'value', 'quantity', 'rating',
-                                          'score', 'count', 'age', 'weight']):
-                value_col = c
-                break
-        if not value_col and numeric_sorted:
-            value_col = numeric_sorted[0]
+        # ── Pick the best value column using scores ──
+        value_col = numeric_sorted[0] if numeric_sorted else None
 
-        # ── Detect the best grouping column ──
-        group_col = None
-        for c in best_cat:
-            name = c.lower()
-            if any(kw in name for kw in ['category', 'type', 'region', 'department',
-                                          'status', 'gender', 'segment', 'channel',
-                                          'product', 'brand', 'class', 'group',
-                                          'city', 'state', 'country', 'store']):
-                group_col = c
-                break
-        if not group_col and best_cat:
-            group_col = best_cat[0]
+        # ── Pick the best grouping column using scores ──
+        cat_sorted = sorted(best_cat, key=lambda c: col_scores.get(c, 0), reverse=True)
+        group_col = cat_sorted[0] if cat_sorted else None
 
         # ── Secondary grouping column ──
         color_col = None
-        if len(best_cat) >= 2:
-            color_col = [c for c in best_cat if c != group_col][0]
+        if len(cat_sorted) >= 2:
+            color_col = cat_sorted[1]
+
+        # Log what was selected
+        self.log(f"  Smart column selection:")
+        self.log(f"    value_col = {value_col} (score: {col_scores.get(value_col, 0):.1f})")
+        self.log(f"    group_col = {group_col} (score: {col_scores.get(group_col, 0):.1f})")
+        if color_col:
+            self.log(f"    color_col = {color_col} (score: {col_scores.get(color_col, 0):.1f})")
+        if data_quality.get('is_likely_synthetic'):
+            self.log(f"    WARNING: Data appears synthetic — limiting composition/ranking insights")
 
         # ══════════════════════════════════════════════════════════════
         # HELPER: generate ACTION TITLES from data
@@ -1728,104 +2333,246 @@ class DataAnalyzerAgent(BaseAgent):
 
     def _build_dashboard(self, df: pd.DataFrame, domain: str, summary: str,
                          insight_list: List[Dict], charts: Dict,
-                         narratives: Dict, output_dir: str) -> go.Figure:
-        """Build a master dashboard HTML page with all insights."""
+                         narratives: Dict, output_dir: str,
+                         kpis: List[Dict] = None, key_takeaways: List[str] = None,
+                         data_quality: Dict = None) -> go.Figure:
+        """Build a professional, production-ready HTML dashboard."""
 
-        # Build an HTML dashboard with embedded Plotly charts
-        html_parts = [
-            '<!DOCTYPE html>',
-            '<html lang="en"><head>',
-            '<meta charset="UTF-8">',
-            '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-            '<title>DataPilot AI Pro — Data Analysis Dashboard</title>',
-            '<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>',
-            '<style>',
-            '  * { margin: 0; padding: 0; box-sizing: border-box; }',
-            '  body { font-family: "Segoe UI", Tahoma, sans-serif; background: #F9FAFB; color: #1F2937; }',
-            '  .header { background: linear-gradient(135deg, #2563EB, #7C3AED); color: white; padding: 40px; text-align: center; }',
-            '  .header h1 { font-size: 2.5em; margin-bottom: 10px; }',
-            '  .header p { font-size: 1.1em; opacity: 0.9; max-width: 800px; margin: 0 auto; }',
-            '  .stats-bar { display: flex; justify-content: center; gap: 40px; padding: 20px; background: white; border-bottom: 1px solid #E5E7EB; }',
-            '  .stat { text-align: center; }',
-            '  .stat-value { font-size: 2em; font-weight: bold; color: #2563EB; }',
-            '  .stat-label { font-size: 0.9em; color: #6B7280; }',
-            '  .container { max-width: 1400px; margin: 0 auto; padding: 30px; }',
-            '  .insight-card { background: white; border-radius: 12px; padding: 25px; margin-bottom: 30px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }',
-            '  .insight-card h3 { color: #2563EB; margin-bottom: 8px; font-size: 1.3em; }',
-            '  .insight-card .narrative { background: #F3F4F6; padding: 15px; border-radius: 8px; margin-top: 15px; font-style: italic; color: #4B5563; border-left: 4px solid #2563EB; }',
-            '  .chart-container { margin-top: 15px; }',
-            '  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }',
-            '  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }',
-            '  .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.8em; font-weight: 600; margin-right: 8px; }',
-            '  .badge-domain { background: #DBEAFE; color: #1D4ED8; }',
-            '  .badge-type { background: #D1FAE5; color: #065F46; }',
-            '  footer { text-align: center; padding: 30px; color: #9CA3AF; font-size: 0.9em; }',
-            '</style>',
-            '</head><body>',
-        ]
+        kpis = kpis or []
+        key_takeaways = key_takeaways or []
+        data_quality = data_quality or {}
+        badge_colors = {
+            'ranking': '#2563EB', 'comparison': '#7C3AED',
+            'composition': '#059669', 'distribution': '#D97706',
+            'correlation': '#DC2626', 'trend': '#0891B2',
+            'overview': '#6B7280', 'general': '#6B7280',
+        }
 
-        # Header
+        html_parts = ['''<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DataPilot AI Pro — Data Analysis Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+         background: #0F172A; color: #E2E8F0; line-height: 1.6; }
+
+  /* Header */
+  .header { background: linear-gradient(135deg, #1E293B 0%, #0F172A 100%);
+            padding: 48px 40px 32px; border-bottom: 1px solid #1E293B; }
+  .header h1 { font-size: 2.2em; font-weight: 800; color: #F8FAFC;
+               margin-bottom: 8px; letter-spacing: -0.5px; }
+  .header .summary { font-size: 1.05em; color: #94A3B8; max-width: 800px;
+                     line-height: 1.7; }
+  .header .meta { display: flex; gap: 24px; margin-top: 16px; flex-wrap: wrap; }
+  .header .meta-item { font-size: 0.85em; color: #64748B; }
+  .header .meta-item b { color: #CBD5E1; }
+
+  /* KPI Cards */
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+             gap: 16px; padding: 24px 40px; background: #0F172A; }
+  .kpi-card { background: #1E293B; border-radius: 12px; padding: 20px 24px;
+              border: 1px solid #334155; transition: border-color 0.2s; }
+  .kpi-card:hover { border-color: #3B82F6; }
+  .kpi-value { font-size: 1.8em; font-weight: 700; color: #F8FAFC;
+               letter-spacing: -0.5px; }
+  .kpi-name { font-size: 0.85em; color: #94A3B8; margin-top: 4px; }
+  .kpi-desc { font-size: 0.75em; color: #64748B; margin-top: 2px; }
+
+  /* Container */
+  .container { max-width: 1400px; margin: 0 auto; padding: 32px 40px; }
+
+  /* Section headers */
+  .section-title { font-size: 1.4em; font-weight: 700; color: #F1F5F9;
+                   margin: 32px 0 16px 0; padding-bottom: 8px;
+                   border-bottom: 2px solid #1E293B; }
+
+  /* Quality warnings */
+  .warnings { background: #1C1917; border: 1px solid #92400E; border-radius: 10px;
+              padding: 16px 20px; margin-bottom: 24px; }
+  .warnings h3 { color: #FBBF24; font-size: 1em; margin-bottom: 8px; }
+  .warnings p { color: #D6D3D1; font-size: 0.9em; margin: 4px 0; }
+
+  /* Takeaways */
+  .takeaways { background: #1E293B; border-radius: 12px; padding: 24px;
+               margin-bottom: 28px; border: 1px solid #334155; }
+  .takeaway-item { padding: 8px 0; color: #CBD5E1; font-size: 0.95em;
+                   border-bottom: 1px solid #1E293B; line-height: 1.7; }
+  .takeaway-item:last-child { border-bottom: none; }
+  .takeaway-item b, .takeaway-item strong { color: #F8FAFC; }
+
+  /* Insight cards */
+  .insight-card { background: #1E293B; border-radius: 12px; margin-bottom: 24px;
+                  border: 1px solid #334155; overflow: hidden;
+                  transition: border-color 0.2s; }
+  .insight-card:hover { border-color: #475569; }
+  .insight-header { padding: 18px 24px 8px; display: flex; align-items: center; gap: 12px; }
+  .insight-title { font-size: 1.15em; font-weight: 600; color: #F1F5F9; flex: 1; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 12px;
+           font-size: 0.7em; font-weight: 600; text-transform: uppercase;
+           letter-spacing: 0.5px; color: white; }
+  .insight-desc { padding: 0 24px 12px; font-size: 0.88em; color: #94A3B8; }
+  .chart-container { padding: 0 8px; }
+  .narrative { background: #0F172A; border-top: 1px solid #334155;
+               padding: 16px 24px; font-size: 0.9em; color: #94A3B8;
+               line-height: 1.7; }
+  .narrative .label { font-weight: 600; margin-right: 4px; }
+
+  /* Grid for overview charts */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  /* Footer */
+  footer { text-align: center; padding: 40px; color: #475569; font-size: 0.85em;
+           border-top: 1px solid #1E293B; margin-top: 40px; }
+  footer a { color: #3B82F6; text-decoration: none; }
+</style>
+</head><body>''']
+
+        # ── HEADER ──
+        n_insights = len([k for k in charts if k.startswith('insight_')])
         html_parts.append(f'''
-        <div class="header">
-            <h1>📊 DataPilot AI Pro — Data Analysis</h1>
-            <p>{summary}</p>
-        </div>
-        ''')
+<div class="header">
+  <h1>Analysis Complete — {n_insights} Insights Discovered</h1>
+  <div class="summary">{summary}</div>
+  <div class="meta">
+    <span class="meta-item">Domain: <b>{domain}</b></span>
+    <span class="meta-item">Charts: <b>{len(charts)}</b></span>
+    <span class="meta-item">Records: <b>{len(df):,}</b></span>
+    <span class="meta-item">Columns: <b>{len(df.columns)}</b></span>
+  </div>
+</div>''')
 
-        # Stats bar
-        html_parts.append(f'''
-        <div class="stats-bar">
-            <div class="stat"><div class="stat-value">{len(df):,}</div><div class="stat-label">Rows</div></div>
-            <div class="stat"><div class="stat-value">{len(df.columns)}</div><div class="stat-label">Columns</div></div>
-            <div class="stat"><div class="stat-value">{domain}</div><div class="stat-label">Domain</div></div>
-            <div class="stat"><div class="stat-value">{len(insight_list)}</div><div class="stat-label">Insights</div></div>
-            <div class="stat"><div class="stat-value">{len(charts)}</div><div class="stat-label">Charts</div></div>
-        </div>
-        ''')
+        # ── KPI CARDS ──
+        if kpis:
+            html_parts.append('<div class="kpi-row">')
+            for kpi in kpis:
+                fmt = kpi.get('format', ',.0f')
+                try:
+                    formatted = f'{kpi["value"]:{fmt}}'
+                except (ValueError, KeyError):
+                    formatted = str(kpi.get('value', ''))
+                html_parts.append(f'''
+  <div class="kpi-card">
+    <div class="kpi-value">{formatted}</div>
+    <div class="kpi-name">{kpi.get("name", "")}</div>
+    <div class="kpi-desc">{kpi.get("description", "")}</div>
+  </div>''')
+            html_parts.append('</div>')
 
         html_parts.append('<div class="container">')
 
-        # Insight cards
-        html_parts.append('<div class="grid">')
-        chart_idx = 0
-        for name, fig in charts.items():
-            insight_info = None
-            if name.startswith('insight_'):
-                idx = int(name.split('_')[1]) - 1
-                if idx < len(insight_list):
-                    insight_info = insight_list[idx]
+        # ── DATA QUALITY WARNINGS ──
+        if data_quality.get('warnings'):
+            html_parts.append('<div class="warnings">')
+            html_parts.append('<h3>Data Quality Warnings</h3>')
+            for w in data_quality['warnings']:
+                html_parts.append(f'<p>{w}</p>')
+            html_parts.append('</div>')
 
-            title = insight_info.get('title', name.replace('_', ' ').title()) if insight_info else name.replace('_', ' ').title()
-            desc = insight_info.get('description', '') if insight_info else ''
-            itype = insight_info.get('insight_type', 'general') if insight_info else 'overview'
+        # ── KEY TAKEAWAYS ──
+        if key_takeaways:
+            html_parts.append('<div class="section-title">Key Takeaways</div>')
+            html_parts.append('<div class="takeaways">')
+            for t in key_takeaways:
+                # Convert markdown bold to HTML bold
+                t_html = t.replace('**', '<b>', 1).replace('**', '</b>', 1)
+                while '**' in t_html:
+                    t_html = t_html.replace('**', '<b>', 1).replace('**', '</b>', 1)
+                html_parts.append(f'<div class="takeaway-item">{t_html}</div>')
+            html_parts.append('</div>')
+
+        # ── INSIGHT CARDS ──
+        html_parts.append('<div class="section-title">Insights Dashboard</div>')
+
+        chart_idx = 0
+        insight_keys = [k for k in charts if k.startswith('insight_')]
+        for name in insight_keys:
+            fig = charts[name]
+            idx = int(name.split('_')[1]) - 1
+            insight_info = insight_list[idx] if idx < len(insight_list) else {}
+
+            title = insight_info.get('title', name.replace('_', ' ').title())
+            desc = insight_info.get('description', '')
+            itype = insight_info.get('insight_type', 'general')
             narrative = narratives.get(name, '')
+            badge_bg = badge_colors.get(itype, '#6B7280')
 
             chart_div_id = f'chart_{chart_idx}'
             chart_json = fig.to_json()
 
+            # Override chart background for dark theme
             html_parts.append(f'''
-            <div class="insight-card">
-                <h3>{title}</h3>
-                <span class="badge badge-type">{itype}</span>
-                <p>{desc}</p>
-                <div class="chart-container" id="{chart_div_id}"></div>
-                <script>
-                    Plotly.newPlot("{chart_div_id}", {chart_json}.data, {chart_json}.layout, {{responsive: true}});
-                </script>
-                {f'<div class="narrative">💡 {narrative}</div>' if narrative else ''}
-            </div>
-            ''')
+<div class="insight-card">
+  <div class="insight-header">
+    <span class="badge" style="background:{badge_bg};">{itype}</span>
+    <span class="insight-title">{title}</span>
+  </div>
+  <div class="insight-desc">{desc}</div>
+  <div class="chart-container" id="{chart_div_id}"></div>
+  <script>
+    (function() {{
+      var spec = {chart_json};
+      spec.layout.paper_bgcolor = '#1E293B';
+      spec.layout.plot_bgcolor = '#1E293B';
+      spec.layout.font = spec.layout.font || {{}};
+      spec.layout.font.color = '#94A3B8';
+      if (spec.layout.title && spec.layout.title.font) spec.layout.title.font.color = '#F1F5F9';
+      if (spec.layout.xaxis) {{ spec.layout.xaxis.gridcolor = '#334155'; spec.layout.xaxis.tickfont = {{color: '#94A3B8'}}; }}
+      if (spec.layout.yaxis) {{ spec.layout.yaxis.gridcolor = '#334155'; spec.layout.yaxis.tickfont = {{color: '#94A3B8'}}; }}
+      if (spec.layout.legend) spec.layout.legend.font = {{color: '#CBD5E1'}};
+      Plotly.newPlot("{chart_div_id}", spec.data, spec.layout, {{responsive: true, displayModeBar: false}});
+    }})();
+  </script>
+  {f'<div class="narrative"><span class="label" style="color:{badge_bg};">Insight:</span> {narrative}</div>' if narrative else ''}
+</div>''')
             chart_idx += 1
 
-        html_parts.append('</div>')  # grid
+        # ── OVERVIEW CHARTS (2-col grid) ──
+        overview_keys = [k for k in charts if k.startswith('overview_')]
+        if overview_keys:
+            html_parts.append('<div class="section-title">Data Overview</div>')
+            html_parts.append('<div class="grid-2">')
+            for name in overview_keys:
+                fig = charts[name]
+                chart_div_id = f'chart_{chart_idx}'
+                chart_json = fig.to_json()
+                readable_name = name.replace('overview_', '').replace('_', ' ').title()
+
+                html_parts.append(f'''
+<div class="insight-card">
+  <div class="insight-header">
+    <span class="badge" style="background:#6B7280;">overview</span>
+    <span class="insight-title">{readable_name}</span>
+  </div>
+  <div class="chart-container" id="{chart_div_id}"></div>
+  <script>
+    (function() {{
+      var spec = {chart_json};
+      spec.layout.paper_bgcolor = '#1E293B';
+      spec.layout.plot_bgcolor = '#1E293B';
+      spec.layout.font = spec.layout.font || {{}};
+      spec.layout.font.color = '#94A3B8';
+      if (spec.layout.title && spec.layout.title.font) spec.layout.title.font.color = '#F1F5F9';
+      if (spec.layout.xaxis) {{ spec.layout.xaxis.gridcolor = '#334155'; spec.layout.xaxis.tickfont = {{color: '#94A3B8'}}; }}
+      if (spec.layout.yaxis) {{ spec.layout.yaxis.gridcolor = '#334155'; spec.layout.yaxis.tickfont = {{color: '#94A3B8'}}; }}
+      if (spec.layout.legend) spec.layout.legend.font = {{color: '#CBD5E1'}};
+      Plotly.newPlot("{chart_div_id}", spec.data, spec.layout, {{responsive: true, displayModeBar: false}});
+    }})();
+  </script>
+</div>''')
+                chart_idx += 1
+            html_parts.append('</div>')  # grid-2
+
         html_parts.append('</div>')  # container
 
         html_parts.append('''
-        <footer>
-            Generated by DataPilot AI Pro — LLM-Powered Data Intelligence
-        </footer>
-        </body></html>
-        ''')
+<footer>
+  Generated by <a href="#">DataPilot AI Pro</a> — LLM-Powered Data Intelligence
+</footer>
+</body></html>''')
 
         # Save dashboard HTML
         dashboard_path = os.path.join(output_dir, 'dashboard.html')
