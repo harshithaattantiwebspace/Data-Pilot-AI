@@ -35,6 +35,16 @@ class ProfilerAgent(BaseAgent):
         target_col = state.get('target_column')
         data_context = state.get('data_context', {})
 
+        # Resolve target column case-insensitively so users can type
+        # "species" and match the actual column "Species"
+        if target_col and target_col not in df.columns:
+            col_lower_map = {c.lower(): c for c in df.columns}
+            matched = col_lower_map.get(target_col.lower())
+            if matched:
+                self.log(f"Column '{target_col}' not found — using '{matched}' (case-insensitive match)")
+                target_col = matched
+                state['target_column'] = target_col
+
         # Step 1: Detect column types
         column_types = self._detect_column_types(df)
         self.log(f"Detected column types: {column_types}")

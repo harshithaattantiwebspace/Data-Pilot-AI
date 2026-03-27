@@ -219,7 +219,7 @@ class DataAnalyzerAgent(BaseAgent):
             '#C3B1E1',  # lavender
             '#F9D5A7',  # peach
         ]
-        self.template = 'plotly_white'
+        self.template = 'plotly_dark'
 
     # =====================================================================
     # MAIN ENTRY POINTS
@@ -301,8 +301,11 @@ class DataAnalyzerAgent(BaseAgent):
 
         # Step 4: Create auto-generated overview charts (always useful)
         self.log("Step 4: Creating overview charts...")
-        overview_charts = self._create_overview_charts(df, data_profile, analyzer_dir)
-        charts.update(overview_charts)
+        try:
+            overview_charts = self._create_overview_charts(df, data_profile, analyzer_dir)
+            charts.update(overview_charts)
+        except Exception as e:
+            self.log(f"  Overview charts warning (non-fatal): {e}")
 
         # Step 5: Generate KPIs and key takeaways
         self.log("Step 5: Generating KPIs and key takeaways...")
@@ -1093,364 +1096,260 @@ class DataAnalyzerAgent(BaseAgent):
                         color_col: Optional[str], agg: str) -> go.Figure:
         """
         Route to the correct chart builder based on type.
-
-        Design Principles Applied:
-        - DECLUTTER: remove all non-data-ink (borders, excessive gridlines, backgrounds)
-        - BARS PREFERRED: most intuitive chart type for comparisons
-        - PIE → HORIZONTAL BAR: pies are hard to read; bars are always better
-        - ZERO BASELINE: bar charts always start at 0 (never truncate)
-        - ANNOTATIONS: highlight the key data point directly on the chart
-        - ACTION TITLES: title tells the insight, not just the axis labels
-        - COGNITIVE LOAD: max 6-8 colors; never 3D; minimal decoration
+        Every chart type uses go.Figure directly for full rendering control.
         """
         color_seq = self.color_sequence
+        self.log(f"  _dispatch_chart: type={chart_type}, rows={len(df)}, "
+                 f"x={x_col}, y={y_col}, color={color_col}, agg={agg}")
 
-        # ── PIE → HORIZONTAL BAR conversion (principle: pies are evil) ──
+        # ── SAFETY: re-aggregate bar data if it looks unaggregated ──
+        def _ensure_aggregated(data, x, y, agg_method):
+            """If data has many rows per category, aggregate it."""
+            if x and y and x in data.columns and y in data.columns:
+                if pd.api.types.is_numeric_dtype(data[y]):
+                    n_rows = len(data)
+                    n_cats = data[x].nunique()
+                    if n_rows > n_cats * 1.5:  # looks unaggregated
+                        func = agg_method if agg_method in ('sum','mean','median','max','min','count') else 'sum'
+                        data = data.groupby(x, as_index=False)[y].agg(func)
+                        self.log(f"    Re-aggregated: {n_rows} rows → {len(data)} rows ({func})")
+            return data
+
+        # ── PIE → HORIZONTAL BAR ──
         if chart_type == 'pie':
-            chart_type = 'bar'
-            # Swap to horizontal bar: category on y, value on x
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
-                plot_data = df.groupby(x_col)[y_col].sum().sort_values()
-                bar_width = 0.5 if len(plot_data) <= 5 else 0.7
+                bar_df = _ensure_aggregated(df, x_col, y_col, 'sum')
+                bar_df = bar_df.sort_values(y_col, ascending=True)
+                vals = bar_df[y_col].values
+                cats = bar_df[x_col].astype(str).values
+                total = vals.sum()
                 fig = go.Figure(go.Bar(
-                    x=plot_data.values,
-                    y=plot_data.index.astype(str),
-                    orientation='h',
-                    marker_color=color_seq[0],
-                    text=[f'{v:,.0f}' for v in plot_data.values],
+                    x=vals, y=cats, orientation='h',
+                    marker_color=[color_seq[i % len(color_seq)] for i in range(len(vals))],
+                    text=[f'{v:,.0f}' for v in vals],
                     textposition='outside',
-                    textfont=dict(size=11, color='#374151'),
-                    width=bar_width,
+                    textfont=dict(size=12, color='#374151'),
+                    width=0.5 if len(vals) <= 5 else 0.7,
                 ))
-                # Annotate the leader
-                if len(plot_data) > 0:
-                    top_name = plot_data.index[-1]
-                    top_val = plot_data.iloc[-1]
-                    total = plot_data.sum()
-                    pct = (top_val / total * 100) if total > 0 else 0
+                if total > 0 and len(vals) > 0:
+                    top_pct = vals[-1] / total * 100
                     fig.add_annotation(
-                        x=top_val, y=top_name,
-                        text=f"  ← {pct:.0f}% of total",
+                        x=vals[-1], y=cats[-1],
+                        text=f"  ← {top_pct:.0f}% of total",
                         showarrow=False, font=dict(size=11, color=color_seq[4]),
                         xanchor='left',
                     )
+                xmax = vals.max()
+                fig.update_layout(xaxis=dict(range=[0, xmax * 1.2]))
             else:
                 fig = go.Figure()
 
+        # ── BAR CHART ──
         elif chart_type == 'bar':
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
-                n_cats = df[x_col].nunique()
-                # Use go.Bar directly for precise control
                 if color_col and color_col in df.columns:
-                    # Grouped bars with color dimension
-                    fig = px.bar(
-                        df, x=x_col, y=y_col, color=color_col,
-                        title=title, color_discrete_sequence=color_seq,
-                        barmode='group',
-                    )
+                    # Grouped bars: aggregate per (x, color) group
+                    func = agg if agg in ('sum','mean','median','max','min','count') else 'mean'
+                    grp = df.groupby([x_col, color_col], as_index=False)[y_col].agg(func)
+                    fig = px.bar(grp, x=x_col, y=y_col, color=color_col,
+                                 color_discrete_sequence=color_seq, barmode='group')
                 else:
-                    # Simple bars — build explicitly for reliability
-                    bar_colors = [color_seq[i % len(color_seq)] for i in range(len(df))]
-                    fmt = '.1f' if df[y_col].max() < 100 else ',.0f'
+                    # Simple bars — always aggregate first
+                    bar_df = _ensure_aggregated(df, x_col, y_col, agg)
+                    bar_df = bar_df.sort_values(y_col, ascending=False)
+                    vals = bar_df[y_col].values.astype(float)
+                    cats = bar_df[x_col].astype(str).values
+                    self.log(f"    Bar values: {list(zip(cats, vals))}")
+                    # Format numbers
+                    if vals.max() >= 1000:
+                        texts = [f'{v:,.0f}' for v in vals]
+                    elif vals.max() >= 10:
+                        texts = [f'{v:.1f}' for v in vals]
+                    else:
+                        texts = [f'{v:.2f}' for v in vals]
                     fig = go.Figure(go.Bar(
-                        x=df[x_col].astype(str),
-                        y=df[y_col],
-                        marker_color=bar_colors,
-                        text=[f'{v:{fmt}}' for v in df[y_col]],
-                        textposition='outside',
-                        textfont=dict(size=11, color='#374151'),
+                        x=cats, y=vals,
+                        marker_color=[color_seq[i % len(color_seq)] for i in range(len(vals))],
+                        text=texts, textposition='outside',
+                        textfont=dict(size=12, color='#374151'),
                     ))
-                # Set bargap so bars have good width
+                n_cats = df[x_col].nunique()
                 bargap = 0.45 if n_cats <= 4 else 0.35 if n_cats <= 8 else 0.25
-                ymax = df[y_col].max()
-                ypad = ymax * 0.18  # room for text-outside labels
-                fig.update_layout(
-                    bargap=bargap,
-                    yaxis=dict(range=[0, ymax + ypad], showgrid=True,
-                               gridcolor='#F3F4F6', gridwidth=0.5),
-                    xaxis=dict(showgrid=False),
-                )
+                fig.update_layout(bargap=bargap)
             else:
                 fig = go.Figure()
 
+        # ── LINE CHART ──
         elif chart_type == 'line':
-            fig = px.line(
-                df, x=x_col, y=y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-                markers=True
-            )
-            # Annotate start and end points for trend reading
+            fig = px.line(df, x=x_col, y=y_col, color=color_col,
+                          title=title, color_discrete_sequence=color_seq, markers=True)
             if y_col and y_col in df.columns and len(df) >= 2:
                 try:
                     first_val = df[y_col].iloc[0]
                     last_val = df[y_col].iloc[-1]
-                    change_pct = ((last_val - first_val) / (abs(first_val) + 1e-9)) * 100
-                    arrow = "▲" if change_pct > 0 else "▼"
-                    color = '#059669' if change_pct > 0 else '#DC2626'
+                    change = ((last_val - first_val) / (abs(first_val) + 1e-9)) * 100
+                    arrow = "▲" if change > 0 else "▼"
+                    clr = '#059669' if change > 0 else '#DC2626'
                     fig.add_annotation(
-                        x=df[x_col].iloc[-1] if x_col and x_col in df.columns else len(df) - 1,
-                        y=last_val,
-                        text=f" {arrow} {abs(change_pct):.0f}%",
-                        showarrow=False,
-                        font=dict(size=12, color=color, weight='bold'),
+                        x=df[x_col].iloc[-1] if x_col and x_col in df.columns else len(df)-1,
+                        y=last_val, text=f" {arrow} {abs(change):.0f}%",
+                        showarrow=False, font=dict(size=12, color=clr, weight='bold'),
                         xanchor='left',
                     )
                 except Exception:
                     pass
 
+        # ── SCATTER PLOT ──
         elif chart_type == 'scatter':
-            # Add jitter for integer columns to avoid overplotting
-            scatter_df = df.copy()
-            if x_col and x_col in scatter_df.columns and pd.api.types.is_integer_dtype(scatter_df[x_col]):
-                if scatter_df[x_col].nunique() <= 20:
-                    jitter_col = x_col + '_jittered'
-                    scatter_df[jitter_col] = scatter_df[x_col].astype(float) + np.random.uniform(-0.2, 0.2, len(scatter_df))
-                    x_col_plot = jitter_col
-                else:
-                    x_col_plot = x_col
-            else:
-                x_col_plot = x_col
-            if y_col and y_col in scatter_df.columns and pd.api.types.is_integer_dtype(scatter_df[y_col]):
-                if scatter_df[y_col].nunique() <= 20:
-                    jitter_col = y_col + '_jittered'
-                    scatter_df[jitter_col] = scatter_df[y_col].astype(float) + np.random.uniform(-0.2, 0.2, len(scatter_df))
-                    y_col_plot = jitter_col
-                else:
-                    y_col_plot = y_col
-            else:
-                y_col_plot = y_col
-
-            # Sample large datasets for readable scatter plots
-            if len(scatter_df) > 5000:
-                scatter_df = scatter_df.sample(5000, random_state=42)
-
-            # Scale marker size based on dataset size
-            n_pts = len(scatter_df)
-            marker_sz = 10 if n_pts < 200 else 7 if n_pts < 1000 else 5
-
-            fig = px.scatter(
-                scatter_df, x=x_col_plot, y=y_col_plot, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-                opacity=0.75, trendline='ols' if x_col_plot and y_col_plot else None
-            )
-            # Make markers visible
-            fig.update_traces(marker=dict(size=marker_sz, line=dict(width=0.5, color='#374151')),
-                              selector=dict(mode='markers'))
-
-            # Restore original axis labels (hide jitter column names)
-            if x_col_plot and x_col_plot != x_col:
-                fig.update_xaxes(title_text=x_col)
-            if y_col_plot and y_col_plot != y_col:
-                fig.update_yaxes(title_text=y_col)
-
-            # Pad axis ranges so points aren't clipped at edges
-            for col_plot, orig_col, axis in [(x_col_plot, x_col, 'x'), (y_col_plot, y_col, 'y')]:
-                if col_plot and col_plot in scatter_df.columns and pd.api.types.is_numeric_dtype(scatter_df[col_plot]):
-                    vals = scatter_df[col_plot].dropna()
-                    if len(vals) > 0:
-                        vmin, vmax = vals.min(), vals.max()
-                        pad = max((vmax - vmin) * 0.08, 0.1)
-                        if axis == 'x':
-                            fig.update_xaxes(range=[vmin - pad, vmax + pad])
-                        else:
-                            fig.update_yaxes(range=[vmin - pad, vmax + pad])
-
-            # Annotate correlation strength
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
-                try:
-                    r = df[x_col].corr(df[y_col])
-                    strength = 'Strong' if abs(r) > 0.6 else 'Moderate' if abs(r) > 0.3 else 'Weak'
-                    fig.add_annotation(
-                        xref='paper', yref='paper', x=0.98, y=0.02,
-                        text=f"r = {r:.2f} ({strength})",
-                        showarrow=False,
-                        font=dict(size=11, color='#6B7280'),
-                        bgcolor='white', bordercolor='#E5E7EB', borderwidth=1,
-                        borderpad=4, xanchor='right', yanchor='bottom',
-                    )
-                except Exception:
-                    pass
+                cols_needed = [c for c in [x_col, y_col, color_col] if c and c in df.columns]
+                sdf = df[cols_needed].dropna().copy()
+                if len(sdf) > 5000:
+                    sdf = sdf.sample(5000, random_state=42)
+                n = len(sdf)
+                msz = 9 if n < 200 else 6 if n < 1000 else 4
+                self.log(f"    Scatter: {n} points, x={x_col}, y={y_col}, color={color_col}")
 
+                # Use px.scatter — guaranteed SVG rendering in all Plotly versions
+                fig = px.scatter(
+                    sdf, x=x_col, y=y_col,
+                    color=color_col if color_col and color_col in sdf.columns else None,
+                    color_discrete_sequence=color_seq,
+                    opacity=0.8,
+                )
+                # Marker size
+                fig.update_traces(marker=dict(size=msz), selector=dict(mode='markers'))
+
+                # Add trendline manually (avoids statsmodels dependency)
+                try:
+                    xv = sdf[x_col].values.astype(float)
+                    yv = sdf[y_col].values.astype(float)
+                    valid = np.isfinite(xv) & np.isfinite(yv)
+                    if valid.sum() > 2:
+                        z = np.polyfit(xv[valid], yv[valid], 1)
+                        x_line = np.linspace(xv[valid].min(), xv[valid].max(), 80)
+                        y_line = np.polyval(z, x_line)
+                        fig.add_trace(go.Scatter(
+                            x=x_line, y=y_line, mode='lines',
+                            line=dict(color='#DC2626', width=2, dash='dash'),
+                            name='Trend', showlegend=False,
+                        ))
+                        # Correlation badge
+                        r = np.corrcoef(xv[valid], yv[valid])[0, 1]
+                        strength = 'Strong' if abs(r) > 0.6 else 'Moderate' if abs(r) > 0.3 else 'Weak'
+                        fig.add_annotation(
+                            xref='paper', yref='paper', x=0.98, y=0.02,
+                            text=f"r = {r:.2f} ({strength})", showarrow=False,
+                            font=dict(size=12, color='#6B7280'),
+                            bgcolor='white', bordercolor='#E5E7EB', borderwidth=1,
+                            borderpad=4, xanchor='right', yanchor='bottom',
+                        )
+                except Exception as e:
+                    self.log(f"    Trendline error: {e}")
+            else:
+                fig = go.Figure()
+
+        # ── HISTOGRAM ──
         elif chart_type == 'histogram':
             col = x_col or y_col
-            # Smart bin count based on data characteristics
-            nbins = 30
             if col and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                n_unique = df[col].nunique()
-                val_range = df[col].max() - df[col].min()
+                values = df[col].dropna()
+                n_unique = values.nunique()
+                val_range = values.max() - values.min()
+                self.log(f"    Histogram: col={col}, n={len(values)}, range={val_range:.2f}, unique={n_unique}")
 
-                if pd.api.types.is_integer_dtype(df[col]):
-                    # Integer columns: use exact bins for small ranges
-                    if n_unique <= 20 or val_range <= 20:
-                        nbins = max(int(val_range) + 1, n_unique)
-                        # Use bar chart for very small integer ranges (like 0-6)
-                        if n_unique <= 10:
-                            vc = df[col].value_counts().sort_index()
-                            fig = go.Figure(go.Bar(
-                                x=[str(v) for v in vc.index],
-                                y=vc.values,
-                                marker_color=color_seq[0],
-                                text=[f'{v:,}' for v in vc.values],
-                                textposition='outside',
-                                textfont=dict(size=11, color='#374151'),
-                                width=0.6,
-                            ))
-                            fig.update_layout(
-                                title=dict(text=title, font=dict(size=16, color='#1F2937')),
-                                xaxis_title=col,
-                                yaxis_title='Count',
-                                bargap=0.15,
-                            )
-                            # Add mean annotation
-                            mean_val = df[col].mean()
-                            fig.add_vline(
-                                x=str(round(mean_val)), line_dash='dot',
-                                line_color='#DC2626', line_width=1.5,
-                                annotation_text=f"Mean: {mean_val:.1f}",
-                                annotation_font=dict(size=11, color='#DC2626'),
-                                annotation_position='top right',
-                            )
-                            return self._apply_clean_layout(fig, title)
+                # Smart bin count
+                if val_range <= 5:
+                    nbins = min(15, max(8, n_unique // 2))
+                elif val_range <= 20:
+                    nbins = 20
                 else:
-                    # Float columns: scale bins to data range
-                    if val_range <= 5:
-                        nbins = min(15, max(8, n_unique // 2))
-                    elif val_range <= 20:
-                        nbins = 20
-                    else:
-                        nbins = min(30, max(15, int(np.sqrt(len(df)))))
+                    nbins = min(35, max(15, int(np.sqrt(len(values)))))
 
-            fig = px.histogram(
-                df, x=col, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-                nbins=nbins, opacity=0.85
-            )
-            # Ensure bars are visible — set bargap
-            fig.update_layout(bargap=0.05)
-            # Annotate mean line
-            if col and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                mean_val = df[col].mean()
+                hist_color = color_col if color_col and color_col in df.columns else None
+
+                # Use px.histogram — reliable across Plotly versions
+                fig = px.histogram(
+                    df, x=col,
+                    color=hist_color,
+                    nbins=nbins,
+                    opacity=0.85,
+                    color_discrete_sequence=color_seq,
+                    barmode='overlay' if hist_color else None,
+                )
+                fig.update_layout(bargap=0.05, yaxis_title='Count')
+
+                # Mean line
+                mean_val = values.mean()
                 fig.add_vline(
-                    x=mean_val, line_dash='dot', line_color='#DC2626', line_width=1.5,
-                    annotation_text=f"Mean: {mean_val:,.1f}",
-                    annotation_font=dict(size=11, color='#DC2626'),
+                    x=mean_val, line_dash='dot', line_color='#DC2626', line_width=2,
+                    annotation_text=f"Mean: {mean_val:.2f}",
+                    annotation_font=dict(size=12, color='#DC2626'),
                     annotation_position='top right',
                 )
+            else:
+                fig = go.Figure()
 
+        # ── BOX PLOT ──
         elif chart_type == 'box':
-            fig = px.box(
-                df, x=x_col, y=y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq
-            )
+            fig = px.box(df, x=x_col, y=y_col, color=color_col,
+                         title=title, color_discrete_sequence=color_seq)
 
+        # ── HEATMAP ──
         elif chart_type == 'heatmap':
             if x_col and y_col:
-                pivot = df.pivot_table(index=y_col, columns=x_col, aggfunc='size',
-                                       fill_value=0)
-                fig = px.imshow(
-                    pivot, title=title, color_continuous_scale='Blues',
-                    text_auto=True
-                )
+                pivot = df.pivot_table(index=y_col, columns=x_col, aggfunc='size', fill_value=0)
+                fig = px.imshow(pivot, title=title, color_continuous_scale='Blues', text_auto=True)
             else:
                 numeric_df = df.select_dtypes(include=[np.number])
                 corr = numeric_df.corr()
-                fig = px.imshow(
-                    corr, title=title, color_continuous_scale='RdBu_r',
-                    zmin=-1, zmax=1, text_auto='.2f'
-                )
+                fig = go.Figure(go.Heatmap(
+                    z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(),
+                    colorscale='RdBu_r', zmin=-1, zmax=1,
+                    text=np.round(corr.values, 2), texttemplate='%{text:.2f}',
+                    textfont=dict(size=11),
+                ))
 
+        # ── TREEMAP ──
         elif chart_type == 'treemap':
             if x_col and y_col:
-                fig = px.treemap(
-                    df, path=[x_col], values=y_col,
-                    title=title, color_discrete_sequence=color_seq
-                )
+                fig = px.treemap(df, path=[x_col], values=y_col,
+                                 title=title, color_discrete_sequence=color_seq)
             else:
-                fig = px.bar(df, x=x_col, y=y_col, title=title)
+                fig = go.Figure()
 
+        # ── FUNNEL ──
         elif chart_type == 'funnel':
-            fig = px.funnel(
-                df, x=y_col, y=x_col,
-                title=title, color_discrete_sequence=color_seq
-            )
+            fig = px.funnel(df, x=y_col, y=x_col,
+                            title=title, color_discrete_sequence=color_seq)
 
+        # ── AREA ──
         elif chart_type == 'area':
-            fig = px.area(
-                df, x=x_col, y=y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq
-            )
+            fig = px.area(df, x=x_col, y=y_col, color=color_col,
+                          title=title, color_discrete_sequence=color_seq)
 
+        # ── FALLBACK ──
         else:
-            fig = px.bar(
-                df, x=x_col, y=y_col, color=color_col,
-                title=title, color_discrete_sequence=color_seq,
-            )
+            fig = px.bar(df, x=x_col, y=y_col, color=color_col,
+                         title=title, color_discrete_sequence=color_seq)
 
         # ══════════════════════════════════════════════════════════════
-        # DECLUTTERED STYLING — every element must earn its place
-        # Principles: remove non-data-ink, reduce cognitive load,
-        #   Gestalt (proximity, similarity), pre-attentive attributes
+        # CLEAN STYLING — applied to all charts
         # ══════════════════════════════════════════════════════════════
         fig.update_layout(
-            template='plotly_white',
+            template='plotly_dark',
             height=460,
             title=dict(
                 text=title,
-                font=dict(size=16, color='#1F2937', family='Segoe UI, sans-serif'),
+                font=dict(size=16, family='Segoe UI, sans-serif'),
                 x=0.01, xanchor='left', y=0.97,
             ),
-            font=dict(family='Segoe UI, sans-serif', size=12, color='#6B7280'),
-            margin=dict(t=55, b=40, l=50, r=25),
-            plot_bgcolor='white',        # clean white — no tinted background
-            paper_bgcolor='white',
+            font=dict(family='Segoe UI, sans-serif', size=12),
+            margin=dict(t=55, b=45, l=55, r=30),
             legend=dict(
                 orientation='h', yanchor='bottom', y=1.02,
                 xanchor='left', x=0, font=dict(size=11),
-                bgcolor='rgba(0,0,0,0)',  # transparent legend background
-                borderwidth=0,
-            ),
-            hoverlabel=dict(
-                bgcolor='white', font_size=12, bordercolor='#E5E7EB',
-                font_family='Segoe UI, sans-serif'
-            ),
-        )
-        # X-axis: labels only, NO gridlines (declutter)
-        fig.update_xaxes(
-            showgrid=False,
-            showline=False,
-            title_font=dict(size=12, color='#9CA3AF'),
-            tickfont=dict(size=11, color='#6B7280'),
-        )
-        # Y-axis: light gridlines only (they aid reading values)
-        # NOTE: do not set autorange here — chart-specific ranges set above are respected
-        fig.update_yaxes(
-            showgrid=True, gridcolor='#F3F4F6', gridwidth=0.5,
-            showline=False,
-            title_font=dict(size=12, color='#9CA3AF'),
-            tickfont=dict(size=11, color='#6B7280'),
-        )
-
-        return fig
-
-    def _apply_clean_layout(self, fig: go.Figure, title: str) -> go.Figure:
-        """Apply the standard decluttered layout to any figure."""
-        fig.update_layout(
-            template='plotly_white',
-            height=460,
-            title=dict(
-                text=title,
-                font=dict(size=16, color='#1F2937', family='Segoe UI, sans-serif'),
-                x=0.01, xanchor='left', y=0.97,
-            ),
-            font=dict(family='Segoe UI, sans-serif', size=12, color='#6B7280'),
-            margin=dict(t=55, b=40, l=50, r=25),
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            legend=dict(
-                orientation='h', yanchor='bottom', y=1.02,
-                xanchor='left', x=0, font=dict(size=11),
-                bgcolor='rgba(0,0,0,0)',
-                borderwidth=0,
+                bgcolor='rgba(0,0,0,0)', borderwidth=0,
             ),
             hoverlabel=dict(
                 bgcolor='white', font_size=12, bordercolor='#E5E7EB',
@@ -1463,10 +1362,47 @@ class DataAnalyzerAgent(BaseAgent):
             tickfont=dict(size=11, color='#6B7280'),
         )
         fig.update_yaxes(
-            showgrid=True, gridcolor='#F3F4F6', gridwidth=0.5,
+            showgrid=True, gridcolor='rgba(255,255,255,0.1)', gridwidth=0.5,
             showline=False,
-            title_font=dict(size=12, color='#9CA3AF'),
-            tickfont=dict(size=11, color='#6B7280'),
+            title_font=dict(size=12),
+            tickfont=dict(size=11),
+        )
+
+        return fig
+
+    def _apply_clean_layout(self, fig: go.Figure, title: str) -> go.Figure:
+        """Apply the standard decluttered layout to any figure."""
+        fig.update_layout(
+            template='plotly_dark',
+            height=460,
+            title=dict(
+                text=title,
+                font=dict(size=16, family='Segoe UI, sans-serif'),
+                x=0.01, xanchor='left', y=0.97,
+            ),
+            font=dict(family='Segoe UI, sans-serif', size=12),
+            margin=dict(t=55, b=40, l=50, r=25),
+            legend=dict(
+                orientation='h', yanchor='bottom', y=1.02,
+                xanchor='left', x=0, font=dict(size=11),
+                bgcolor='rgba(0,0,0,0)',
+                borderwidth=0,
+            ),
+            hoverlabel=dict(
+                font_size=12,
+                font_family='Segoe UI, sans-serif'
+            ),
+        )
+        fig.update_xaxes(
+            showgrid=False, showline=False,
+            title_font=dict(size=12),
+            tickfont=dict(size=11),
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor='rgba(255,255,255,0.1)', gridwidth=0.5,
+            showline=False,
+            title_font=dict(size=12),
+            tickfont=dict(size=11),
         )
         return fig
 
@@ -1553,12 +1489,9 @@ class DataAnalyzerAgent(BaseAgent):
                 fig_title = 'Numeric column distributions'
 
             fig.update_layout(
-                title=dict(text=fig_title, font=dict(size=15, color='#1F2937')),
-                template='plotly_white', height=480, showlegend=False,
-                plot_bgcolor='white', paper_bgcolor='white',
+                title=dict(text=fig_title, font=dict(size=15)),
+                template='plotly_dark', height=480, showlegend=False,
                 margin=dict(t=55, b=40, l=50, r=25),
-                yaxis=dict(showgrid=True, gridcolor='#F3F4F6', gridwidth=0.5),
-                xaxis=dict(showgrid=False),
             )
             charts['overview_numeric'] = fig
             self._save_figure(fig, output_dir, 'overview_numeric')
@@ -1589,10 +1522,9 @@ class DataAnalyzerAgent(BaseAgent):
                 )
             fig.update_layout(
                 title=dict(text='Categorical columns — most frequent values',
-                           font=dict(size=15, color='#1F2937')),
+                           font=dict(size=15)),
                 height=200 * n_show + 80,
-                template='plotly_white',
-                plot_bgcolor='white', paper_bgcolor='white',
+                template='plotly_dark',
                 margin=dict(t=55, b=30, l=120, r=40),
             )
             fig.update_xaxes(showgrid=False, showline=False)
@@ -1617,16 +1549,22 @@ class DataAnalyzerAgent(BaseAgent):
             except Exception:
                 corr_title = 'Feature correlations'
 
-            fig = px.imshow(
-                corr, title=corr_title,
-                color_continuous_scale='RdBu_r', zmin=-1, zmax=1,
-                text_auto='.2f'
-            )
+            z = corr.values
+            labels = corr.columns.tolist()
+            fig = go.Figure(go.Heatmap(
+                z=z, x=labels, y=labels,
+                colorscale='RdBu_r', zmin=-1, zmax=1,
+                text=[[f'{v:.2f}' for v in row] for row in z],
+                texttemplate='%{text}',
+                textfont=dict(size=10),
+                colorbar=dict(thickness=15, len=0.9),
+            ))
             fig.update_layout(
-                template='plotly_white', height=580,
-                title_font=dict(size=15, color='#1F2937'),
-                plot_bgcolor='white', paper_bgcolor='white',
-                margin=dict(t=55, b=30, l=50, r=25),
+                title=dict(text=corr_title, font=dict(size=15, color='#1F2937')),
+                template='plotly_dark', height=500,
+                margin=dict(t=55, b=60, l=80, r=25),
+                xaxis=dict(tickangle=-45),
+                **_base
             )
             charts['overview_correlation'] = fig
             self._save_figure(fig, output_dir, 'overview_correlation')
@@ -2616,7 +2554,8 @@ class DataAnalyzerAgent(BaseAgent):
         """Save a Plotly figure as HTML and optionally PNG."""
         try:
             html_path = os.path.join(output_dir, f'{name}.html')
-            fig.write_html(html_path, include_plotlyjs='cdn')
+            fig.write_html(html_path, include_plotlyjs='cdn', full_html=True,
+                           config={'responsive': True, 'displayModeBar': True})
         except Exception as e:
             self.log(f"  Warning: Could not save HTML for {name}: {e}")
 

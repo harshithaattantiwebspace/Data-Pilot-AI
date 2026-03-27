@@ -98,7 +98,7 @@ class VisualizerAgent(BaseAgent):
             '#0891B2', '#EC4899', '#F59E0B', '#10B981', '#6366F1'
         ]
         # Plotly template
-        self.template = 'plotly_white'
+        self.template = 'plotly_dark'
 
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Generate all visualizations from the pipeline state."""
@@ -277,10 +277,10 @@ class VisualizerAgent(BaseAgent):
         fig.add_annotation(
             text=summary_text, xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
-            font=dict(size=16), align="left",
+            font=dict(size=16, color='#e2e8f0'), align="left",
             bordercolor=self.colors['primary'],
             borderwidth=2, borderpad=20,
-            bgcolor=self.colors['light']
+            bgcolor='rgba(30,41,59,0.95)'
         )
         fig.update_layout(
             template=self.template, height=400,
@@ -496,6 +496,11 @@ class VisualizerAgent(BaseAgent):
         y = state['y']
         task_type = state.get('task_type', 'classification')
         feature_report = state.get('feature_report', {})
+        target_col = state.get('target_column', '')
+
+        # Use cleaned (pre-encoding) data for distribution/correlation charts
+        # so we show meaningful original-scale values, not scaled/encoded values
+        current_df = state.get('current_data')
 
         # Guard: keep only numeric columns to avoid datetime/bool errors
         if isinstance(X, pd.DataFrame):
@@ -509,13 +514,23 @@ class VisualizerAgent(BaseAgent):
             X = X[numeric_X_cols]
 
         # --- 3.1 Feature Correlation Heatmap ---
-        if isinstance(X, pd.DataFrame) and len(X.columns) > 1:
-            n_features_plot = min(20, len(X.columns))
-            # Pick features with highest variance for the heatmap
-            variances = X.select_dtypes(include=[np.number]).var().sort_values(ascending=False)
+        # Prefer using cleaned pre-encoding data for meaningful correlations
+        corr_source = None
+        if current_df is not None:
+            num_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
+            if target_col and target_col in num_cols:
+                num_cols.remove(target_col)
+            if len(num_cols) > 1:
+                corr_source = current_df[num_cols]
+        if corr_source is None and isinstance(X, pd.DataFrame) and len(X.columns) > 1:
+            corr_source = X.select_dtypes(include=[np.number])
+
+        if corr_source is not None and len(corr_source.columns) > 1:
+            n_features_plot = min(20, len(corr_source.columns))
+            variances = corr_source.var().sort_values(ascending=False)
             top_features = variances.head(n_features_plot).index.tolist()
 
-            corr_matrix = X[top_features].corr()
+            corr_matrix = corr_source[top_features].corr()
 
             fig = go.Figure(data=go.Heatmap(
                 z=corr_matrix.values,
@@ -589,36 +604,58 @@ class VisualizerAgent(BaseAgent):
                 self.log(f"  Warning: Feature importance chart failed: {e}")
 
         # --- 3.3 Top Feature Distributions (Violin Plots) ---
-        if isinstance(X, pd.DataFrame) and len(X.columns) > 0:
-            # Use MI scores if available, else variance
+        # Determine candidate features — prefer pre-encoding cleaned data
+        dist_source = None
+        if current_df is not None:
+            dist_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
+            if target_col and target_col in dist_cols:
+                dist_cols.remove(target_col)
+            if dist_cols:
+                dist_source = current_df[dist_cols]
+        if dist_source is None and isinstance(X, pd.DataFrame) and len(X.columns) > 0:
+            dist_source = X
+
+        if dist_source is not None and len(dist_source.columns) > 0:
+            # Use MI scores if available, else pick by variance from dist_source
             try:
-                top_features = mi_df.tail(6)['feature'].tolist()
-            except:
-                top_features = X.var().sort_values(ascending=False).head(6).index.tolist()
+                candidate_feats = mi_df.tail(6)['feature'].tolist()
+                # Keep only features present in dist_source
+                top_feats = [f for f in candidate_feats if f in dist_source.columns]
+                if not top_feats:
+                    top_feats = dist_source.var().sort_values(ascending=False).head(6).index.tolist()
+            except Exception:
+                top_feats = dist_source.var().sort_values(ascending=False).head(6).index.tolist()
+
+            n_top = min(6, len(top_feats))
+            n_cols_v = min(3, n_top)
+            n_rows_v = (n_top + n_cols_v - 1) // n_cols_v
 
             fig = make_subplots(
-                rows=2, cols=3,
-                subplot_titles=top_features[:6]
+                rows=n_rows_v, cols=n_cols_v,
+                subplot_titles=top_feats[:n_top]
             )
-            for idx, feat in enumerate(top_features[:6]):
-                row = idx // 3 + 1
-                col_pos = idx % 3 + 1
-                if feat in X.columns:
+            for idx, feat in enumerate(top_feats[:n_top]):
+                row = idx // n_cols_v + 1
+                col_pos = idx % n_cols_v + 1
+                feat_data = dist_source[feat].dropna()
+                if len(feat_data) > 1:
                     fig.add_trace(
                         go.Violin(
-                            y=X[feat].dropna(),
+                            y=feat_data,
                             box_visible=True,
                             meanline_visible=True,
                             fillcolor=self.color_sequence[idx % len(self.color_sequence)],
-                            line_color=self.colors['dark'],
-                            opacity=0.7,
+                            line_color='rgba(255,255,255,0.8)',
+                            opacity=0.75,
                             name=feat, showlegend=False
                         ),
                         row=row, col=col_pos
                     )
             fig.update_layout(
                 title=dict(text='Top Feature Distributions', font=dict(size=20)),
-                template=self.template, height=600, showlegend=False
+                template=self.template,
+                height=300 * n_rows_v,
+                showlegend=False
             )
             visuals['top_feature_distributions'] = fig
             self._save_figure(fig, viz_dir, 'top_feature_distributions')
@@ -841,10 +878,10 @@ class VisualizerAgent(BaseAgent):
                     list(range(1, len(model_names) + 1))
                 ],
                 fill_color=[
-                    [self.colors['light'] if i % 2 == 0 else 'white'
+                    ['#1e293b' if i % 2 == 0 else '#0f172a'
                      for i in range(len(model_names))]
                 ],
-                font=dict(size=13),
+                font=dict(size=13, color='#e2e8f0'),
                 align='left'
             )
         )])
@@ -865,9 +902,17 @@ class VisualizerAgent(BaseAgent):
         """Generate confusion matrix heatmap for classification."""
         visuals = {}
         try:
-            y_pred = cross_val_predict(model, X, y, cv=3)
-            cm = confusion_matrix(y, y_pred)
-            labels = sorted(y.unique())
+            # Convert to numpy to avoid feature-name mismatch in VotingClassifier
+            X_arr = X.values if isinstance(X, pd.DataFrame) else X
+            y_arr = y.values if isinstance(y, pd.Series) else y
+            try:
+                y_pred = cross_val_predict(model, X_arr, y_arr, cv=3)
+            except Exception:
+                # Fallback: fit on full data and predict (less rigorous but still useful)
+                model.fit(X_arr, y_arr)
+                y_pred = model.predict(X_arr)
+            cm = confusion_matrix(y_arr, y_pred)
+            labels = sorted(np.unique(y_arr))
 
             # Normalize
             cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
@@ -900,8 +945,14 @@ class VisualizerAgent(BaseAgent):
         """Generate residuals plot for regression."""
         visuals = {}
         try:
-            y_pred = cross_val_predict(model, X, y, cv=3)
-            residuals = y - y_pred
+            X_arr = X.values if isinstance(X, pd.DataFrame) else X
+            y_arr = y.values if isinstance(y, pd.Series) else y
+            try:
+                y_pred = cross_val_predict(model, X_arr, y_arr, cv=3)
+            except Exception:
+                model.fit(X_arr, y_arr)
+                y_pred = model.predict(X_arr)
+            residuals = y_arr - y_pred
 
             fig = make_subplots(
                 rows=1, cols=2,
@@ -911,15 +962,15 @@ class VisualizerAgent(BaseAgent):
             # Predicted vs Actual scatter
             fig.add_trace(
                 go.Scatter(
-                    x=y, y=y_pred, mode='markers',
+                    x=y_arr, y=y_pred, mode='markers',
                     marker=dict(color=self.colors['primary'], size=5, opacity=0.5),
                     name='Predictions'
                 ),
                 row=1, col=1
             )
             # Perfect prediction line
-            min_val = min(y.min(), y_pred.min())
-            max_val = max(y.max(), y_pred.max())
+            min_val = min(float(y_arr.min()), float(y_pred.min()))
+            max_val = max(float(y_arr.max()), float(y_pred.max()))
             fig.add_trace(
                 go.Scatter(
                     x=[min_val, max_val], y=[min_val, max_val],
@@ -1037,8 +1088,11 @@ class VisualizerAgent(BaseAgent):
             )
 
         # Panel 4: Pipeline Summary Table
+        n_rows = profile.get('n_rows', '?')
+        n_cols = profile.get('n_cols', '?')
+        size_str = f"{n_rows:,}" if isinstance(n_rows, int) else str(n_rows)
         summary_rows = [
-            ['Dataset Size', f"{profile.get('n_rows', '?'):,} × {profile.get('n_cols', '?')}"],
+            ['Dataset Size', f"{size_str} × {n_cols}"],
             ['Task Type', task_type.title()],
             ['Target', state.get('target_column', 'N/A')],
             ['Best Model', best_model],
@@ -1055,8 +1109,8 @@ class VisualizerAgent(BaseAgent):
                 ),
                 cells=dict(
                     values=list(zip(*summary_rows)),
-                    fill_color=self.colors['light'],
-                    font=dict(size=12),
+                    fill_color='#1e293b',
+                    font=dict(size=12, color='#e2e8f0'),
                     align='left'
                 )
             ),
@@ -1086,7 +1140,12 @@ class VisualizerAgent(BaseAgent):
         """Save a Plotly figure as interactive HTML and static PNG."""
         try:
             html_path = os.path.join(viz_dir, f'{name}.html')
-            fig.write_html(html_path, include_plotlyjs='cdn')
+            fig.write_html(
+                html_path,
+                include_plotlyjs='cdn',
+                full_html=True,
+                config={'responsive': True, 'displayModeBar': True},
+            )
         except Exception as e:
             self.log(f"  Warning: Could not save HTML for {name}: {e}")
 

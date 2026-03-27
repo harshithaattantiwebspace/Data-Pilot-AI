@@ -119,7 +119,7 @@ class ExplainerAgent(BaseAgent):
             'negative': '#2563EB',   # Blue = pushes prediction DOWN
             'neutral':  '#9CA3AF',
         }
-        self.template = 'plotly_white'
+        self.template = 'plotly_dark'
 
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Generate comprehensive model explanations."""
@@ -307,13 +307,25 @@ class ExplainerAgent(BaseAgent):
                 shap_values = explainer.shap_values(X_explain)
                 X = X_explain  # Use the smaller sample for charts
 
-            # Handle multi-class SHAP values (take class 1 for binary)
-            if isinstance(shap_values, list):
+            # Handle multi-class SHAP values
+            # Newer SHAP may return 3D ndarray (n_samples, n_features, n_classes)
+            # Older SHAP returns a list of 2D arrays, one per class
+            if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                # (n_samples, n_features, n_classes) — average abs across classes
+                shap_values = np.mean(np.abs(shap_values), axis=2)
+            elif isinstance(shap_values, list):
                 if len(shap_values) == 2:
-                    shap_values = shap_values[1]  # Positive class
+                    shap_values = shap_values[1]  # Binary: positive class
                 else:
-                    # Multi-class: take the mean absolute across classes
-                    shap_values = np.mean([np.abs(sv) for sv in shap_values], axis=0)
+                    # Multi-class: mean absolute across classes
+                    shap_values = np.mean(
+                        np.abs(np.array(shap_values)), axis=0
+                    )
+
+            # Ensure 2D float array
+            shap_values = np.array(shap_values, dtype=float)
+            if shap_values.ndim == 1:
+                shap_values = shap_values.reshape(1, -1)
 
             # Compute feature importance (mean absolute SHAP)
             mean_abs_shap = np.abs(shap_values).mean(axis=0)
@@ -818,7 +830,7 @@ class ExplainerAgent(BaseAgent):
             header=dict(values=['<b>AI-Generated Explanation</b>'],
                        fill_color='#2563EB', font=dict(color='white', size=13)),
             cells=dict(values=[[narrative_display]],
-                      fill_color='#F3F4F6', font=dict(size=11),
+                      fill_color='#1e293b', font=dict(color='#e2e8f0', size=11),
                       align='left', height=30)
         ), row=2, col=1)
 
@@ -833,7 +845,7 @@ class ExplainerAgent(BaseAgent):
                      str(len(importance)) if importance is not None else 'N/A',
                      str(len(explanations.get('lime_explanations', [])))]
                 ],
-                fill_color='#F3F4F6', font=dict(size=12), align='left'
+                fill_color='#1e293b', font=dict(color='#e2e8f0', size=12), align='left'
             )
         ), row=2, col=2)
 
@@ -853,7 +865,8 @@ class ExplainerAgent(BaseAgent):
         """Save a Plotly figure as HTML and optionally PNG."""
         try:
             html_path = os.path.join(output_dir, f'{name}.html')
-            fig.write_html(html_path, include_plotlyjs='cdn')
+            fig.write_html(html_path, include_plotlyjs='cdn', full_html=True,
+                           config={'responsive': True, 'displayModeBar': True})
         except Exception as e:
             self.log(f"  Warning: Could not save HTML for {name}: {e}")
         try:
