@@ -669,12 +669,22 @@ class VisualizerAgent(BaseAgent):
             # Count encoding methods used
             encoding_methods = {}
             for col_info in encoding_info.values():
-                method = col_info if isinstance(col_info, str) else str(col_info)
+                if isinstance(col_info, dict):
+                    method = col_info.get('method', 'unknown')
+                elif isinstance(col_info, str):
+                    method = col_info
+                else:
+                    method = str(col_info)
                 encoding_methods[method] = encoding_methods.get(method, 0) + 1
 
             scaling_methods = {}
             for col_info in scaling_info.values():
-                method = col_info if isinstance(col_info, str) else str(col_info)
+                if isinstance(col_info, dict):
+                    method = col_info.get('method', 'unknown')
+                elif isinstance(col_info, str):
+                    method = col_info
+                else:
+                    method = str(col_info)
                 scaling_methods[method] = scaling_methods.get(method, 0) + 1
 
             # Create summary chart

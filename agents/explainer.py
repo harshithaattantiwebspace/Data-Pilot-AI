@@ -786,11 +786,17 @@ class ExplainerAgent(BaseAgent):
 
         # Panel 1: Top 10 importance
         importance = explanations.get('shap_importance')
-        if importance is not None:
+        if importance is not None and len(importance) > 0:
             top10 = importance.head(10).sort_values('importance', ascending=True)
             fig.add_trace(go.Bar(
                 x=top10['importance'], y=top10['feature'],
                 orientation='h', marker_color='#DC2626',
+                showlegend=False
+            ), row=1, col=1)
+        else:
+            fig.add_trace(go.Bar(
+                x=[0], y=['SHAP data unavailable'],
+                orientation='h', marker_color='#4B5563',
                 showlegend=False
             ), row=1, col=1)
 
@@ -799,10 +805,6 @@ class ExplainerAgent(BaseAgent):
         if shap_values is not None and len(shap_values) > 0:
             sv = shap_values[0]
             sorted_idx = np.argsort(np.abs(sv))[::-1][:8]
-            feat_names = [explanations.get('shap_importance', pd.DataFrame()).iloc[0]['feature']
-                         if importance is not None else f'Feature {i}'
-                         for i in sorted_idx]
-            # Use actual column names from the data if shap_importance is available
             if importance is not None:
                 all_features = importance['feature'].tolist()
                 feat_names = []
@@ -811,12 +813,20 @@ class ExplainerAgent(BaseAgent):
                         feat_names.append(all_features[si])
                     else:
                         feat_names.append(f'Feature {si}')
+            else:
+                feat_names = [f'Feature {si}' for si in sorted_idx]
 
             fig.add_trace(go.Bar(
                 x=[sv[i] for i in sorted_idx],
                 y=feat_names,
                 orientation='h',
                 marker_color=['#DC2626' if sv[i] > 0 else '#2563EB' for i in sorted_idx],
+                showlegend=False
+            ), row=1, col=2)
+        else:
+            fig.add_trace(go.Bar(
+                x=[0], y=['SHAP data unavailable'],
+                orientation='h', marker_color='#4B5563',
                 showlegend=False
             ), row=1, col=2)
 
