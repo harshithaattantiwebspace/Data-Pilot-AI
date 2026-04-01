@@ -283,17 +283,30 @@ class ExplainerAgent(BaseAgent):
             # Choose the right SHAP explainer
             model_type = type(model).__name__
 
-            if model_type in ('XGBClassifier', 'XGBRegressor',
-                              'LGBMClassifier', 'LGBMRegressor'):
-                # Tree SHAP — exact and fast for tree models
-                explainer = shap.TreeExplainer(model)
-                shap_values = explainer.shap_values(X)
-            elif model_type in ('RandomForestClassifier', 'RandomForestRegressor',
-                                'ExtraTreesClassifier', 'ExtraTreesRegressor',
-                                'GradientBoostingClassifier', 'GradientBoostingRegressor',
-                                'CatBoostClassifier', 'CatBoostRegressor'):
-                explainer = shap.TreeExplainer(model)
-                shap_values = explainer.shap_values(X)
+            tree_model_types = (
+                'XGBClassifier', 'XGBRegressor',
+                'LGBMClassifier', 'LGBMRegressor',
+                'RandomForestClassifier', 'RandomForestRegressor',
+                'ExtraTreesClassifier', 'ExtraTreesRegressor',
+                'GradientBoostingClassifier', 'GradientBoostingRegressor',
+                'CatBoostClassifier', 'CatBoostRegressor',
+            )
+            if model_type in tree_model_types:
+                # Tree SHAP — try with check_additivity=False first for robustness
+                try:
+                    explainer = shap.TreeExplainer(model)
+                    shap_values = explainer.shap_values(X, check_additivity=False)
+                except Exception as tree_err:
+                    self.log(f"  TreeExplainer failed ({tree_err}), falling back to KernelExplainer")
+                    n_explain = min(50, len(X))
+                    X_explain = X.sample(n=n_explain, random_state=42)
+                    explainer = shap.KernelExplainer(
+                        model.predict_proba if hasattr(model, 'predict_proba') and task_type == 'classification'
+                        else model.predict,
+                        background.iloc[:min(50, len(background))]
+                    )
+                    shap_values = explainer.shap_values(X_explain, nsamples=100)
+                    X = X_explain
             else:
                 # Kernel SHAP — model-agnostic but slower
                 # Use a smaller sample for Kernel SHAP

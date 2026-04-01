@@ -941,10 +941,23 @@ elif active_view == 'ml':
                     try:
                         import numpy as np_pred
                         input_df = pd.DataFrame([user_inputs])
-                        
+
                         # Ensure columns are in the right order
                         input_df = input_df[feature_names]
-                        
+
+                        # Apply the same numeric scaler used during training
+                        scalers = result.get('scalers', {})
+                        numeric_scaler = scalers.get('numeric')
+                        cols_scaled = (result.get('feature_report', {})
+                                       .get('scaling', {})
+                                       .get('columns_scaled', []))
+                        if numeric_scaler is not None and cols_scaled:
+                            available_scaled = [c for c in cols_scaled if c in input_df.columns]
+                            if available_scaled:
+                                input_df[available_scaled] = numeric_scaler.transform(
+                                    input_df[available_scaled]
+                                )
+
                         model = result['ensemble_model']
                         prediction = model.predict(input_df)[0]
                         

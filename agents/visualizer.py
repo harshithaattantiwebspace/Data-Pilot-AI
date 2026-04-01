@@ -660,64 +660,6 @@ class VisualizerAgent(BaseAgent):
             visuals['top_feature_distributions'] = fig
             self._save_figure(fig, viz_dir, 'top_feature_distributions')
 
-        # --- 3.4 Feature Engineering Summary ---
-        encoding_info = feature_report.get('encoding', {})
-        scaling_info = feature_report.get('scaling', {})
-        selection_info = feature_report.get('feature_selection', {})
-
-        if encoding_info or scaling_info:
-            # Count encoding methods used
-            encoding_methods = {}
-            for col_info in encoding_info.values():
-                if isinstance(col_info, dict):
-                    method = col_info.get('method', 'unknown')
-                elif isinstance(col_info, str):
-                    method = col_info
-                else:
-                    method = str(col_info)
-                encoding_methods[method] = encoding_methods.get(method, 0) + 1
-
-            scaling_methods = {}
-            for col_info in scaling_info.values():
-                if isinstance(col_info, dict):
-                    method = col_info.get('method', 'unknown')
-                elif isinstance(col_info, str):
-                    method = col_info
-                else:
-                    method = str(col_info)
-                scaling_methods[method] = scaling_methods.get(method, 0) + 1
-
-            # Create summary chart
-            fig = make_subplots(
-                rows=1, cols=2,
-                subplot_titles=['Encoding Methods Used', 'Scaling Methods Used'],
-                specs=[[{"type": "pie"}, {"type": "pie"}]]
-            )
-            if encoding_methods:
-                fig.add_trace(
-                    go.Pie(
-                        labels=list(encoding_methods.keys()),
-                        values=list(encoding_methods.values()),
-                        marker_colors=self.color_sequence,
-                        hole=0.3
-                    ), row=1, col=1
-                )
-            if scaling_methods:
-                fig.add_trace(
-                    go.Pie(
-                        labels=list(scaling_methods.keys()),
-                        values=list(scaling_methods.values()),
-                        marker_colors=self.color_sequence[3:],
-                        hole=0.3
-                    ), row=1, col=2
-                )
-            fig.update_layout(
-                title=dict(text='Feature Engineering Summary', font=dict(size=20)),
-                template=self.template, height=400
-            )
-            visuals['feature_engineering_summary'] = fig
-            self._save_figure(fig, viz_dir, 'feature_engineering_summary')
-
         return visuals
 
     # =========================================================================

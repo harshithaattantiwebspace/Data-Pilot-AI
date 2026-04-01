@@ -138,8 +138,18 @@ class ProfilerAgent(BaseAgent):
                 column_types[col] = 'datetime'
             # Check if numeric (any int or float dtype)
             elif pd.api.types.is_numeric_dtype(df[col]):
+                # Detect integer ID columns (e.g. 'Id', 'user_id', 'record_id')
+                col_lower = col.lower().strip()
+                is_id_name = (
+                    col_lower in ('id', 'index', 'key', 'row', 'rowid', 'row_id', 'no', 'num', 'number') or
+                    col_lower.endswith('_id') or col_lower.endswith('id') or
+                    col_lower.startswith('id_')
+                )
+                if (is_id_name and unique_ratio > 0.90 and
+                        pd.api.types.is_integer_dtype(df[col])):
+                    column_types[col] = 'id'
                 # Could be categorical if very few unique values relative to dataset
-                if n_unique <= 20 and unique_ratio < 0.05:
+                elif n_unique <= 20 and unique_ratio < 0.05:
                     column_types[col] = 'categorical'
                 else:
                     column_types[col] = 'numeric'
