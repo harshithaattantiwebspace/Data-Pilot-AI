@@ -1,4 +1,4 @@
-# DataPilot AI Pro
+# DataPilot AI 
 
 **Enterprise Autonomous Data Science Platform** — Upload a CSV, get ML models, explainability, and business insights automatically.
 
